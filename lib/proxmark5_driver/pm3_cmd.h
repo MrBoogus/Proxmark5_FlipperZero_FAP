@@ -372,6 +372,81 @@ typedef struct {
 } PACKED mfc_eload_t;
 
 typedef struct {
+    uint8_t sectorno;
+    uint8_t keytype;
+    uint8_t key[6];
+} PACKED mf_readsector_t;
+
+typedef struct {
+    uint8_t params;
+    uint8_t blockno;
+    uint8_t data[];
+} PACKED mf_chinese_blk_t;
+
+typedef struct {
+    uint8_t is_mfc;
+    uint8_t keytype;
+    uint8_t key[6];
+} PACKED mf_chinese_ident_t;
+
+typedef struct {
+    uint8_t uidlen;
+    uint8_t uid[];
+} PACKED mf_gen3uid_t;
+
+typedef struct {
+    uint8_t blocklen;
+    uint8_t block[];
+} PACKED mf_gen3blk_t;
+
+typedef struct {
+    uint32_t start_index;
+    uint32_t bytes;
+    uint8_t data[];
+} PACKED download_req_t;
+
+typedef struct {
+    uint32_t offset;
+    uint8_t data[];
+} PACKED download_chunk_t;
+
+typedef struct {
+    uint32_t bytes_sent;
+    uint32_t extra;
+} PACKED download_done_t;
+
+#define MAGIC_UID                   0x01
+#define MAGIC_WUPC                  0x02
+#define MAGIC_HALT                  0x04
+#define MAGIC_INIT                  0x08
+#define MAGIC_OFF                   0x10
+#define MAGIC_DATAIN                0x20
+#define MAGIC_WIPE                  0x40
+#define MAGIC_GDM_ALT_WUPC          0x80
+#define MAGIC_SINGLE                (MAGIC_HALT | MAGIC_INIT | MAGIC_OFF)
+
+#define MAGIC_FLAG_NONE            0x0000
+#define MAGIC_FLAG_GEN_1A          0x0001
+#define MAGIC_FLAG_GEN_1B          0x0002
+#define MAGIC_FLAG_GEN_2           0x0004
+#define MAGIC_FLAG_GEN_UNFUSED     0x0008
+#define MAGIC_FLAG_SUPER_GEN1      0x0010
+#define MAGIC_FLAG_SUPER_GEN2      0x0020
+#define MAGIC_FLAG_NTAG21X         0x0040
+#define MAGIC_FLAG_GEN_3           0x0080
+#define MAGIC_FLAG_GEN_4GTU        0x0100
+#define MAGIC_FLAG_GDM_AUTH        0x0200
+#define MAGIC_FLAG_QL88            0x0400
+#define MAGIC_FLAG_GDM_WUP_20      0x0800
+#define MAGIC_FLAG_GDM_WUP_40      0x1000
+#define MAGIC_FLAG_GDM_WUP_40_ZUID 0x2000
+
+#define ISO14443A_CMD_READBLOCK     0x30
+#define ISO14443A_CMD_WRITEBLOCK    0xA0
+#define MIFARE_AUTH_KEYA            0x60
+#define MIFARE_AUTH_KEYB            0x61
+
+typedef struct {
     bool use_flashmem;
     uint16_t keycount;
     uint8_t keys[];
@@ -1187,5 +1262,32 @@ typedef struct {
     uint8_t  rfu;
     uint8_t  data[];
 } PACKED iso14a_raw_resp_t;
+
+// PM5 Hardware Control Commands (Smart Antenna, RGB LEDs, Power Save)
+#define CMD_ANT_CONTROL_WRITE   0x0170
+#define CMD_ANT_CONTROL_READ    0x0171
+#define CMD_PM5_RGB_SET         0x0178
+#define CMD_PM5_POWERSAVE       0x0180
+
+#define PM5_ANT_I2C_ADDR        0x51
+#define PM5_ANT_CTRL_REG        0x02
+
+#define ICLASS_READER_OPT_LEFT  0x01
+
+typedef struct {
+    uint8_t mode;
+    uint8_t scale;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t brightness;
+    uint8_t start_r;
+    uint8_t start_g;
+    uint8_t start_b;
+    uint8_t end_r;
+    uint8_t end_g;
+    uint8_t end_b;
+    uint16_t step_ms;
+} PACKED pm5_rgb_ctrl_t;
 
 #endif

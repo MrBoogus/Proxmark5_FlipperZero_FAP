@@ -76,6 +76,14 @@ bool proxmark5_spi_trx_raw(uint8_t* buffer, size_t length, uint32_t timeout) {
     return furi_hal_spi_bus_trx(spi_bus, NULL, buffer, length, timeout);
 }
 
+bool proxmark5_spi_trx_bytes_raw(
+    const uint8_t* tx_data,
+    uint8_t* rx_buffer,
+    size_t length,
+    uint32_t timeout) {
+    return furi_hal_spi_bus_trx(spi_bus, (uint8_t*)tx_data, rx_buffer, length, timeout);
+}
+
 /**
  * @brief Receive data over SPI from proxmark5, will release the bus after reception
  * 

@@ -23,6 +23,9 @@ bool proxmark5_frame_get_response(PacketResponseNG* packet);
 // Take first cached response that matches cmd. Returns false if no matched cmd.
 bool proxmark5_frame_take_by_cmd(uint16_t cmd, PacketResponseNG* packet);
 
+// Pop the most recent debug print string (ANSI-stripped). Returns false if none since last pop/reset.
+bool proxmark5_frame_pop_log(char* out, size_t max_len);
+
 void clearCommandBuffer(void);
 
 void SendCommandOLD(

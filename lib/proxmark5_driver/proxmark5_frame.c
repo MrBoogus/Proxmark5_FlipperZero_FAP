@@ -18,6 +18,8 @@ typedef struct {
     PacketResponseNG cache[PM3_RESPONSE_CACHE_SIZE];
     uint8_t head;
     uint8_t tail;
+    char last_log[160];
+    bool has_new_log;
     // The SPI RX thread enqueues while worker threads take; the ring needs a lock.
     FuriMutex* mutex;
 } Proxmark5FrameContext;
@@ -85,6 +87,28 @@ static void proxmark5_frame_log_print_string(uint8_t* data, size_t length, uint1
     size_t copy_len = length > PM3_CMD_DATA_SIZE ? PM3_CMD_DATA_SIZE : length;
     memcpy(log_message, data, copy_len);
     log_message[copy_len] = '\0';
+
+    // Store ANSI-stripped copy in frame_context.last_log for UI pages (e.g. LF watch)
+    proxmark5_frame_lock();
+    size_t out_idx = 0;
+    for(size_t i = 0; i < copy_len && out_idx + 1U < sizeof(frame_context.last_log); i++) {
+        if(log_message[i] == '\x1b' && (i + 1U) < copy_len && log_message[i + 1U] == '[') {
+            i += 2U;
+            while(i < copy_len && log_message[i] != 'm' &&
+                  ((log_message[i] >= '0' && log_message[i] <= '9') || log_message[i] == ';')) {
+                i++;
+            }
+            continue;
+        }
+        if(log_message[i] >= 0x20 && log_message[i] <= 0x7E) {
+            frame_context.last_log[out_idx++] = log_message[i];
+        }
+    }
+    if(out_idx > 0) {
+        frame_context.last_log[out_idx] = '\0';
+        frame_context.has_new_log = true;
+    }
+    proxmark5_frame_unlock();
 
     if(flag & PM3_FLAG_LOG) {
         FURI_LOG_I(PROXMARK5_LOG_TAG, "[#] %s", log_message);
@@ -275,7 +299,25 @@ void proxmark5_frame_reset(void) {
     proxmark5_frame_lock();
     frame_context.head = 0;
     frame_context.tail = 0;
+    frame_context.has_new_log = false;
+    frame_context.last_log[0] = '\0';
     proxmark5_frame_unlock();
+}
+
+bool proxmark5_frame_pop_log(char* out, size_t max_len) {
+    if(out == NULL || max_len == 0) {
+        return false;
+    }
+    proxmark5_frame_lock();
+    if(!frame_context.has_new_log) {
+        proxmark5_frame_unlock();
+        return false;
+    }
+    strncpy(out, frame_context.last_log, max_len - 1U);
+    out[max_len - 1U] = '\0';
+    frame_context.has_new_log = false;
+    proxmark5_frame_unlock();
+    return true;
 }
 
 void clearCommandBuffer(void) {
@@ -367,6 +409,7 @@ bool WaitForResponseTimeout(uint16_t cmd, PacketResponseNG* packet, uint32_t tim
     uint32_t start_time = furi_get_tick();
 
     while((furi_get_tick() - start_time) < timeout_ms) {
+        proxmark5_com_keep_fast_poll();
         if(proxmark5_frame_take_by_cmd(cmd, packet)) {
             return true;
         }

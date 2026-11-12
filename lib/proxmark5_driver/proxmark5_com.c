@@ -19,6 +19,7 @@ typedef struct {
     volatile bool handshake_waiting;
     volatile bool handshake_matched;
     uint8_t handshake_state;
+    bool otg_attempted;
 
     // Thread for handling SPI communication
     FuriThread* thread_rx_spi;
@@ -27,6 +28,7 @@ typedef struct {
     // Tick of the last send attempt; RX poll uses a short-sleep window
     // right after, since a reply typically lands within tens of ms.
     volatile uint32_t last_send_tick;
+    volatile bool break_loop_active;
 
     // RX packet buffer stored in context (heap-backed via com_context)
     uint8_t packet[BUFFER_SIZE];
@@ -113,7 +115,9 @@ static int32_t proxmark5_com_spi_task(void* context) {
         // every CS edge, so splitting desyncs the two sides.
         proxmark5_spi_acquire();
 
-        if(!proxmark5_spi_trx_raw(spi_len_header, sizeof(spi_len_header), 100)) {
+        static const uint8_t k_break_tx[2] = {0x55, 0x55};
+        const uint8_t* poll_tx = com_context->break_loop_active ? k_break_tx : NULL;
+        if(!proxmark5_spi_trx_bytes_raw(poll_tx, spi_len_header, sizeof(spi_len_header), 100)) {
             proxmark5_spi_release();
             furi_delay_ms(fast ? FAST_POLL_PENALTY_MS : PENALTY_POLL_MS);
             continue;
@@ -130,6 +134,7 @@ static int32_t proxmark5_com_spi_task(void* context) {
         }
 
         FURI_LOG_I(PROXMARK5_LOG_TAG, "Data length to receive: %u", data_length);
+        com_context->break_loop_active = false;
 
         bool got_payload = proxmark5_spi_trx_raw(com_context->packet, data_length, 2000);
         proxmark5_spi_release();
@@ -191,7 +196,9 @@ void proxmark5_com_init(void) {
     com_context->handshake_waiting = false;
     com_context->handshake_matched = false;
     com_context->handshake_state = 0;
+    com_context->otg_attempted = false;
     com_context->last_send_tick = furi_get_tick() - FAST_POLL_WINDOW_MS;
+    com_context->break_loop_active = false;
 
     proxmark5_frame_init();
 
@@ -239,12 +246,20 @@ bool proxmark5_com_handshake(void) {
     // furi_delay_ms(500);
     // return false;
 
-    // If OTG is not enabled, enable it to power the proxmark5(5v)
+    // If OTG is not enabled, try enabling it to power the proxmark5 (5V)
     if(!furi_hal_power_is_otg_enabled()) {
-        furi_hal_power_enable_otg();
-        // Wait for proxmark5 to power on and be ready
-        furi_delay_ms(500);
-        FURI_LOG_I(PROXMARK5_LOG_TAG, "OTG enabled to power proxmark5");
+        bool otg_ok = furi_hal_power_enable_otg();
+        if(!com_context->otg_attempted) {
+            com_context->otg_attempted = true;
+            if(otg_ok) {
+                furi_delay_ms(500);
+                FURI_LOG_I(PROXMARK5_LOG_TAG, "OTG 5V enabled to power proxmark5");
+            } else {
+                FURI_LOG_W(
+                    PROXMARK5_LOG_TAG,
+                    "OTG 5V unavailable (Flipper USB VBUS connected); PM5 needs external/BWM power");
+            }
+        }
     }
 
     // Check IDLE or disconnected.
@@ -260,17 +275,23 @@ bool proxmark5_com_handshake(void) {
     com_context->handshake_matched = false;
     com_context->handshake_state = 0;
 
-    // Send a simple start byte to wakeup/reset proxmark5
+    // 1) Send STX wake byte first and wait >50ms so PM5's cep_attach_poll()
+    //    (which runs every 50ms) sees USART_RDBF_FLAG and enters cep_do_handshake().
     proxmark5_uart_send_byte(0x02);
-    // Send a simple handshake message over UART
+    furi_delay_ms(65);
+
+    // 2) Now that PM5 is actively polling USART1 in cep_do_handshake(),
+    //    send STX + handshake string and switch SPI RX into fast-poll mode.
+    com_context->last_send_tick = furi_get_tick();
+    proxmark5_uart_send_byte(0x02);
     proxmark5_uart_send_string(PROXMARK5_UART_HANDSHAKE_MSG);
 
     // Wait for proxmark5 to process the handshake message
-    furi_delay_ms(100);
+    furi_delay_ms(50);
 
     // Start time
     uint32_t start_time = furi_get_tick();
-    while(furi_get_tick() - start_time < 1000) { // 1 second timeout for handshake response
+    while(furi_get_tick() - start_time < 800) {
         if(com_context->handshake_matched) {
             return true;
         }
@@ -296,7 +317,20 @@ bool proxmark5_com_handshake(void) {
 // so PM5's polled SPI1 reception has a wide enough window to notice the
 // frame start. Must match armsrc/pm5_cep.c's cep_spi_data_available().
 #define SYNC_BYTE 0x55
-#define SYNC_LEN  500 // ~2ms at 2MHz
+#define SYNC_LEN  580 // ~2.3ms at 2MHz (safely under PM5's CEP_SYNC_MAX_DISCARD = 600)
+
+void proxmark5_com_keep_fast_poll(void) {
+    if(com_context != NULL) {
+        com_context->last_send_tick = furi_get_tick();
+    }
+}
+
+void proxmark5_com_set_break_loop(bool active) {
+    if(com_context != NULL) {
+        com_context->break_loop_active = active;
+        com_context->last_send_tick = furi_get_tick();
+    }
+}
 
 bool proxmark5_com_send_spi(uint8_t* data, size_t length) {
     if(com_context == NULL || data == NULL || length == 0 || length > BUFFER_SIZE) {
@@ -305,22 +339,47 @@ bool proxmark5_com_send_spi(uint8_t* data, size_t length) {
 
     com_context->last_send_tick = furi_get_tick();
 
-    // Build preamble + length header + payload + trailer in one buffer and
+    // Build preamble + length header + payload in one buffer and
     // send it as a single tx call - splitting the transfer desyncs PM5's
     // HW-CS slave mode, same as the RX side.
-    uint8_t frame_buf[SYNC_LEN + 2 + BUFFER_SIZE + 1];
+    uint8_t frame_buf[SYNC_LEN + 2 + BUFFER_SIZE];
     memset(frame_buf, SYNC_BYTE, SYNC_LEN);
     frame_buf[SYNC_LEN + 0] = (uint8_t)(length & 0xFF);
     frame_buf[SYNC_LEN + 1] = (uint8_t)((length >> 8) & 0xFF);
     memcpy(frame_buf + SYNC_LEN + 2, data, length);
-    frame_buf[SYNC_LEN + 2 + length] = 0x00; // DXL: last byte must be 0x00 to keep the proxmark5 no data rx.
 
     proxmark5_spi_acquire();
-    bool ok = proxmark5_spi_tx_raw(frame_buf, SYNC_LEN + 2 + length + 1, 1000);
+    bool ok = proxmark5_spi_tx_raw(frame_buf, SYNC_LEN + 2 + length, 1000);
     proxmark5_spi_release();
 
     if(!ok) {
         FURI_LOG_W(PROXMARK5_LOG_TAG, "SPI send failed");
     }
     return ok;
+}
+
+bool proxmark5_com_request_ng(
+    uint16_t req_cmd,
+    uint8_t* data,
+    size_t len,
+    uint16_t resp_cmd,
+    PacketResponseNG* resp,
+    uint32_t timeout_ms,
+    uint8_t max_attempts) {
+    if(max_attempts == 0) {
+        max_attempts = 1;
+    }
+    for(uint8_t attempt = 0; attempt < max_attempts; attempt++) {
+        if(attempt > 0) {
+            // Re-establish CEP active state in case PM5's 3s CEP_ACTIVITY_TIMEOUT_MS expired
+            proxmark5_com_handshake();
+        }
+        clearCommandBuffer();
+        SendCommandNG(req_cmd, data, len);
+        if(WaitForResponseTimeout(resp_cmd, resp, timeout_ms)) {
+            return true;
+        }
+        furi_delay_ms(15);
+    }
+    return false;
 }
