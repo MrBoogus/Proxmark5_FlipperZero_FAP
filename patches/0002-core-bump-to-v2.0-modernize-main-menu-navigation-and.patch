@@ -1,0 +1,978 @@
+From 24d3f826e986bfa3952fa892232b11e32c81c0dd Mon Sep 17 00:00:00 2001
+From: MrBoogus <90836807+MrBoogus@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:18:32 +0300
+Subject: [PATCH 2/4] core: bump to v2.0, modernize main menu navigation, and
+ enhance status dashboard
+
+- Bump application version to 2.0 and update manifest metadata in application.fam.
+- Expand application state in fmps_cxt.h and fmps_cxt.c to allocate and manage
+  all 10 modular tool views.
+- Refactor main_page.c to organize operations into categorized items with icon
+  indicators and direct submenu navigation.
+- Update operate_page to handle scrollable item lists and back navigation.
+- Enhance status_page with 4 telemetry pages (Core, Power, Link, Sched)
+  displaying battery fuel gauge, CEP SPI activity, and live round-trip latency.
+---
+ application.fam           |   4 +-
+ fmps_cxt.c                | 270 ++++++++++++++++++++++++++++++++++----
+ fmps_cxt.h                |  37 +++++-
+ pages/main_page.c         |  24 ++--
+ pages/operate_page.c      | 149 +++++++++++++++++++--
+ pages/operate_page.h      |  48 +++++--
+ pages/status_page.c       |  81 ++++++++----
+ pages/status_page_tests.c |   7 +-
+ 8 files changed, 530 insertions(+), 90 deletions(-)
+
+diff --git a/application.fam b/application.fam
+index 3d6290d..ffb6878 100644
+--- a/application.fam
++++ b/application.fam
+@@ -8,9 +8,9 @@ App(
+     stack_size=4 * 1024,
+     fap_category="rfid",
+     # Optional values
+-    fap_version="0.1",
++    fap_version="2.0",
+     fap_icon="images/fmps_cxt.png",  # 10x10 1-bit PNG
+-    fap_description="Operate your PM5 on F0",
++    fap_description="Proxmark5 Companion Suite v2.0",
+     fap_author="DXL",
+     fap_weburl="https://github.com/RfidResearchGroup/Proxmark5_FlipperZero_FAP",
+     fap_icon_assets="images",  # Image assets to compile for this application
+diff --git a/fmps_cxt.c b/fmps_cxt.c
+index 655ba10..c8b4c50 100644
+--- a/fmps_cxt.c
++++ b/fmps_cxt.c
+@@ -4,11 +4,6 @@
+ #include "fmps_cxt.h"
+ #include "proxmark5_com.h"
+ 
+-// For GUI:
+-//  https://github.com/jamisonderek/flipper-zero-tutorials/wiki/User-Interface#viewdisptacher
+-//  https://brodan.biz/blog/a-visual-guide-to-flipper-zero-gui-components/
+-
+-// The callback for the back event, it will stop the view dispatcher which will exit the app
+ static bool fmps_cxt_back_event_callback(void* context) {
+     Proxmark5App* app = context;
+     view_dispatcher_stop(app->view_dispatcher);
+@@ -32,6 +27,51 @@ static void fmps_cxt_open_read_hf14a_page(void* context) {
+         app->view_dispatcher, Proxmark5CustomEventOpenReadHf14aPage);
+ }
+ 
++static void fmps_cxt_open_hf_mf_audit_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(
++        app->view_dispatcher, Proxmark5CustomEventOpenHfMfAuditPage);
++}
++
++static void fmps_cxt_open_hf_sniff_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenHfSniffPage);
++}
++
++static void fmps_cxt_open_read_hf_multi_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(
++        app->view_dispatcher, Proxmark5CustomEventOpenReadHfMultiPage);
++}
++
++static void fmps_cxt_open_lf_lab_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenLfLabPage);
++}
++
++static void fmps_cxt_open_t5577_suite_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(
++        app->view_dispatcher, Proxmark5CustomEventOpenT5577SuitePage);
++}
++
++static void fmps_cxt_open_rf_scope_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenRfScopePage);
++}
++
++static void fmps_cxt_open_antenna_tune_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(
++        app->view_dispatcher, Proxmark5CustomEventOpenAntennaTunePage);
++}
++
++static void fmps_cxt_open_pm5_control_page(void* context) {
++    Proxmark5App* app = context;
++    view_dispatcher_send_custom_event(
++        app->view_dispatcher, Proxmark5CustomEventOpenPm5ControlPage);
++}
++
+ static void fmps_cxt_open_status_page(void* context) {
+     Proxmark5App* app = context;
+     view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenStatusPage);
+@@ -52,6 +92,37 @@ static bool fmps_cxt_custom_event_callback(void* context, uint32_t event) {
+         view_dispatcher_switch_to_view(app->view_dispatcher, ReadHf14aPageViewId);
+         read_hf14a_page_start(app->read_hf14a_page);
+         return true;
++    case Proxmark5CustomEventOpenHfMfAuditPage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, HfMfAuditPageViewId);
++        hf_mf_audit_page_start(app->hf_mf_audit_page);
++        return true;
++    case Proxmark5CustomEventOpenHfSniffPage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, HfSniffPageViewId);
++        hf_sniff_page_start(app->hf_sniff_page);
++        return true;
++    case Proxmark5CustomEventOpenReadHfMultiPage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, ReadHfMultiPageViewId);
++        read_hf_multi_page_start(app->read_hf_multi_page);
++        return true;
++    case Proxmark5CustomEventOpenLfLabPage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, LfLabPageViewId);
++        lf_lab_page_start(app->lf_lab_page);
++        return true;
++    case Proxmark5CustomEventOpenT5577SuitePage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, T5577SuitePageViewId);
++        return true;
++    case Proxmark5CustomEventOpenRfScopePage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, RfScopePageViewId);
++        rf_scope_page_start(app->rf_scope_page);
++        return true;
++    case Proxmark5CustomEventOpenAntennaTunePage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, AntennaTunePageViewId);
++        antenna_tune_page_start(app->antenna_tune_page);
++        return true;
++    case Proxmark5CustomEventOpenPm5ControlPage:
++        view_dispatcher_switch_to_view(app->view_dispatcher, Pm5ControlPageViewId);
++        pm5_control_page_start(app->pm5_control_page);
++        return true;
+     case Proxmark5CustomEventOpenStatusPage:
+         view_dispatcher_switch_to_view(app->view_dispatcher, StatusPageViewId);
+         status_page_start(app->status_page);
+@@ -66,20 +137,65 @@ static uint32_t operate_page_previous_callback(void* context) {
+     return MainPageViewId;
+ }
+ 
+-// Context is the view's context, which is the page itself (set in read_hitag2_page_create).
+ static uint32_t read_hitag2_page_previous_callback(void* context) {
+     ReadHitag2Page* read_hitag2_page = context;
+     read_hitag2_page_stop(read_hitag2_page);
+     return OperatePageViewId;
+ }
+ 
+-// Context is the view's context, which is the page itself (set in read_hf14a_page_create).
+ static uint32_t read_hf14a_page_previous_callback(void* context) {
+     ReadHf14aPage* read_hf14a_page = context;
+     read_hf14a_page_stop(read_hf14a_page);
+     return OperatePageViewId;
+ }
+ 
++static uint32_t hf_mf_audit_page_previous_callback(void* context) {
++    HfMfAuditPage* page = context;
++    hf_mf_audit_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t hf_sniff_page_previous_callback(void* context) {
++    HfSniffPage* page = context;
++    hf_sniff_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t read_hf_multi_page_previous_callback(void* context) {
++    ReadHfMultiPage* page = context;
++    read_hf_multi_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t lf_lab_page_previous_callback(void* context) {
++    LfLabPage* page = context;
++    lf_lab_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t t5577_suite_page_previous_callback(void* context) {
++    UNUSED(context);
++    return OperatePageViewId;
++}
++
++static uint32_t rf_scope_page_previous_callback(void* context) {
++    RfScopePage* page = context;
++    rf_scope_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t antenna_tune_page_previous_callback(void* context) {
++    AntennaTunePage* page = context;
++    antenna_tune_page_stop(page);
++    return OperatePageViewId;
++}
++
++static uint32_t pm5_control_page_previous_callback(void* context) {
++    Pm5ControlPage* page = context;
++    pm5_control_page_stop(page);
++    return OperatePageViewId;
++}
++
+ static uint32_t status_page_previous_callback(void* context) {
+     StatusPage* status_page = context;
+     status_page_stop(status_page);
+@@ -90,21 +206,33 @@ Proxmark5App* proxmark5_app_alloc() {
+     Proxmark5App* app = calloc(1, sizeof(Proxmark5App));
+     app->gui = furi_record_open(RECORD_GUI);
+ 
+-    // Allocate the view dispatcher and attach it to the GUI
+     app->view_dispatcher = view_dispatcher_alloc();
+-    // Attach the view dispatcher to the GUI with fullscreen type
+     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+ 
+-    // Create and add the main page view to the view dispatcher
+     app->main_page = main_page_create(fmps_cxt_open_operate_page, app);
+     view_dispatcher_add_view(app->view_dispatcher, MainPageViewId, app->main_page->canvas_view);
+ 
+-    // Create and add the operate submenu page to the view dispatcher
+     app->operate_page = operate_page_create(
+         fmps_cxt_open_read_hitag2_page,
+         app,
+         fmps_cxt_open_read_hf14a_page,
+         app,
++        fmps_cxt_open_hf_mf_audit_page,
++        app,
++        fmps_cxt_open_hf_sniff_page,
++        app,
++        fmps_cxt_open_read_hf_multi_page,
++        app,
++        fmps_cxt_open_lf_lab_page,
++        app,
++        fmps_cxt_open_t5577_suite_page,
++        app,
++        fmps_cxt_open_rf_scope_page,
++        app,
++        fmps_cxt_open_antenna_tune_page,
++        app,
++        fmps_cxt_open_pm5_control_page,
++        app,
+         fmps_cxt_open_status_page,
+         app);
+     view_set_previous_callback(
+@@ -112,9 +240,6 @@ Proxmark5App* proxmark5_app_alloc() {
+     view_dispatcher_add_view(
+         app->view_dispatcher, OperatePageViewId, submenu_get_view(app->operate_page->submenu));
+ 
+-    // Create and add ReadHitag2 page to the view dispatcher
+-    // The left "Back" button returns to the functions menu, same destination as the
+-    // hardware back button below.
+     app->read_hitag2_page = read_hitag2_page_create(fmps_cxt_open_operate_page, app);
+     view_set_previous_callback(
+         read_hitag2_page_get_view(app->read_hitag2_page), read_hitag2_page_previous_callback);
+@@ -123,8 +248,6 @@ Proxmark5App* proxmark5_app_alloc() {
+         ReadHitag2PageViewId,
+         read_hitag2_page_get_view(app->read_hitag2_page));
+ 
+-    // Create and add HF 14a Reader page to the view dispatcher - same Back
+-    // button/destination convention as ReadHitag2 above.
+     app->read_hf14a_page = read_hf14a_page_create(fmps_cxt_open_operate_page, app);
+     view_set_previous_callback(
+         read_hf14a_page_get_view(app->read_hf14a_page), read_hf14a_page_previous_callback);
+@@ -133,14 +256,77 @@ Proxmark5App* proxmark5_app_alloc() {
+         ReadHf14aPageViewId,
+         read_hf14a_page_get_view(app->read_hf14a_page));
+ 
+-    // Create and add the hardware-status dashboard to the view dispatcher.
++    app->hf_mf_audit_page = hf_mf_audit_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        hf_mf_audit_page_get_view(app->hf_mf_audit_page), hf_mf_audit_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        HfMfAuditPageViewId,
++        hf_mf_audit_page_get_view(app->hf_mf_audit_page));
++
++    app->hf_sniff_page = hf_sniff_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        hf_sniff_page_get_view(app->hf_sniff_page), hf_sniff_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        HfSniffPageViewId,
++        hf_sniff_page_get_view(app->hf_sniff_page));
++
++    app->read_hf_multi_page = read_hf_multi_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        read_hf_multi_page_get_view(app->read_hf_multi_page),
++        read_hf_multi_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        ReadHfMultiPageViewId,
++        read_hf_multi_page_get_view(app->read_hf_multi_page));
++
++    app->lf_lab_page = lf_lab_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        lf_lab_page_get_view(app->lf_lab_page), lf_lab_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        LfLabPageViewId,
++        lf_lab_page_get_view(app->lf_lab_page));
++
++    app->t5577_suite_page = t5577_suite_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        t5577_suite_page_get_view(app->t5577_suite_page), t5577_suite_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        T5577SuitePageViewId,
++        t5577_suite_page_get_view(app->t5577_suite_page));
++
++    app->rf_scope_page = rf_scope_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        rf_scope_page_get_view(app->rf_scope_page), rf_scope_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        RfScopePageViewId,
++        rf_scope_page_get_view(app->rf_scope_page));
++
++    app->antenna_tune_page = antenna_tune_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        antenna_tune_page_get_view(app->antenna_tune_page), antenna_tune_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        AntennaTunePageViewId,
++        antenna_tune_page_get_view(app->antenna_tune_page));
++
++    app->pm5_control_page = pm5_control_page_create(fmps_cxt_open_operate_page, app);
++    view_set_previous_callback(
++        pm5_control_page_get_view(app->pm5_control_page), pm5_control_page_previous_callback);
++    view_dispatcher_add_view(
++        app->view_dispatcher,
++        Pm5ControlPageViewId,
++        pm5_control_page_get_view(app->pm5_control_page));
++
+     app->status_page = status_page_create();
+     view_set_previous_callback(
+         status_page_get_view(app->status_page), status_page_previous_callback);
+     view_dispatcher_add_view(
+         app->view_dispatcher, StatusPageViewId, status_page_get_view(app->status_page));
+ 
+-    // Set the back event callback to handle the back button press, and pass the app context to it
+     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
+     view_dispatcher_set_navigation_event_callback(
+         app->view_dispatcher, fmps_cxt_back_event_callback);
+@@ -156,7 +342,16 @@ void proxmark5_app_free(Proxmark5App* app) {
+     view_dispatcher_remove_view(app->view_dispatcher, OperatePageViewId);
+     view_dispatcher_remove_view(app->view_dispatcher, ReadHitag2PageViewId);
+     view_dispatcher_remove_view(app->view_dispatcher, ReadHf14aPageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, HfMfAuditPageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, HfSniffPageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, ReadHfMultiPageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, LfLabPageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, T5577SuitePageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, RfScopePageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, AntennaTunePageViewId);
++    view_dispatcher_remove_view(app->view_dispatcher, Pm5ControlPageViewId);
+     view_dispatcher_remove_view(app->view_dispatcher, StatusPageViewId);
++
+     if(app->main_page) {
+         main_page_free(app->main_page);
+         app->main_page = NULL;
+@@ -173,31 +368,58 @@ void proxmark5_app_free(Proxmark5App* app) {
+         read_hf14a_page_free(app->read_hf14a_page);
+         app->read_hf14a_page = NULL;
+     }
++    if(app->hf_mf_audit_page) {
++        hf_mf_audit_page_free(app->hf_mf_audit_page);
++        app->hf_mf_audit_page = NULL;
++    }
++    if(app->hf_sniff_page) {
++        hf_sniff_page_free(app->hf_sniff_page);
++        app->hf_sniff_page = NULL;
++    }
++    if(app->read_hf_multi_page) {
++        read_hf_multi_page_free(app->read_hf_multi_page);
++        app->read_hf_multi_page = NULL;
++    }
++    if(app->lf_lab_page) {
++        lf_lab_page_free(app->lf_lab_page);
++        app->lf_lab_page = NULL;
++    }
++    if(app->t5577_suite_page) {
++        t5577_suite_page_destroy(app->t5577_suite_page);
++        app->t5577_suite_page = NULL;
++    }
++    if(app->rf_scope_page) {
++        rf_scope_page_free(app->rf_scope_page);
++        app->rf_scope_page = NULL;
++    }
++    if(app->antenna_tune_page) {
++        antenna_tune_page_free(app->antenna_tune_page);
++        app->antenna_tune_page = NULL;
++    }
++    if(app->pm5_control_page) {
++        pm5_control_page_free(app->pm5_control_page);
++        app->pm5_control_page = NULL;
++    }
+     if(app->status_page) {
+         status_page_free(app->status_page);
+         app->status_page = NULL;
+     }
++
+     view_dispatcher_free(app->view_dispatcher);
+     furi_record_close(RECORD_GUI);
+     free(app);
+ }
+ 
+-// Furi application entry point
+ int32_t fmps_cxt_app(void* p) {
+     UNUSED(p);
+ 
+-    // Initialize proxmark5 communication interfaces
+     proxmark5_com_init();
+ 
+-    // Create the app context and start the view dispatcher
+     Proxmark5App* app = proxmark5_app_alloc();
+-    // Default to the main page view
+     view_dispatcher_switch_to_view(app->view_dispatcher, MainPageViewId);
+     view_dispatcher_run(app->view_dispatcher);
+-    // Free the app context and exit
+     proxmark5_app_free(app);
+ 
+-    // Deinitialize proxmark5 communication interfaces
+     proxmark5_com_deinit();
+ 
+     return 0;
+diff --git a/fmps_cxt.h b/fmps_cxt.h
+index edffe49..ad06a6b 100644
+--- a/fmps_cxt.h
++++ b/fmps_cxt.h
+@@ -10,18 +10,29 @@
+ #include "pages/operate_page.h"
+ #include "pages/read_hitag2_page.h"
+ #include "pages/read_hf14a_page.h"
++#include "pages/hf_mf_audit_page.h"
++#include "pages/hf_sniff_page.h"
++#include "pages/read_hf_multi_page.h"
++#include "pages/lf_lab_page.h"
++#include "pages/t5577_suite_page.h"
++#include "pages/rf_scope_page.h"
++#include "pages/antenna_tune_page.h"
++#include "pages/pm5_control_page.h"
+ #include "pages/status_page.h"
+ 
+ typedef enum {
+-    // The main page of the app, showing the connection status and some basic info
+     MainPageViewId,
+-    // The operate page, showing operation submenu
+     OperatePageViewId,
+-    // Read Hitag2 operation page
+     ReadHitag2PageViewId,
+-    // HF 14a Reader operation page
+     ReadHf14aPageViewId,
+-    // Paginated hardware-status dashboard (Core/Power/Link)
++    HfMfAuditPageViewId,
++    HfSniffPageViewId,
++    ReadHfMultiPageViewId,
++    LfLabPageViewId,
++    T5577SuitePageViewId,
++    RfScopePageViewId,
++    AntennaTunePageViewId,
++    Pm5ControlPageViewId,
+     StatusPageViewId,
+ } Proxmark5ViewId;
+ 
+@@ -29,6 +40,14 @@ typedef enum {
+     Proxmark5CustomEventOpenOperatePage,
+     Proxmark5CustomEventOpenReadHitag2Page,
+     Proxmark5CustomEventOpenReadHf14aPage,
++    Proxmark5CustomEventOpenHfMfAuditPage,
++    Proxmark5CustomEventOpenHfSniffPage,
++    Proxmark5CustomEventOpenReadHfMultiPage,
++    Proxmark5CustomEventOpenLfLabPage,
++    Proxmark5CustomEventOpenT5577SuitePage,
++    Proxmark5CustomEventOpenRfScopePage,
++    Proxmark5CustomEventOpenAntennaTunePage,
++    Proxmark5CustomEventOpenPm5ControlPage,
+     Proxmark5CustomEventOpenStatusPage,
+ } Proxmark5CustomEvent;
+ 
+@@ -41,6 +60,14 @@ typedef struct {
+     OperatePage* operate_page;
+     ReadHitag2Page* read_hitag2_page;
+     ReadHf14aPage* read_hf14a_page;
++    HfMfAuditPage* hf_mf_audit_page;
++    HfSniffPage* hf_sniff_page;
++    ReadHfMultiPage* read_hf_multi_page;
++    LfLabPage* lf_lab_page;
++    T5577SuitePage* t5577_suite_page;
++    RfScopePage* rf_scope_page;
++    AntennaTunePage* antenna_tune_page;
++    Pm5ControlPage* pm5_control_page;
+     StatusPage* status_page;
+ } Proxmark5App;
+ 
+diff --git a/pages/main_page.c b/pages/main_page.c
+index 32911f6..cc36cfe 100644
+--- a/pages/main_page.c
++++ b/pages/main_page.c
+@@ -73,12 +73,13 @@ static bool main_page_input_callback(InputEvent* event, void* ctx) {
+     }
+ 
+     MainPageModel* model = view_get_model(page->canvas_view);
++    bool ready = (model->state == MainPageShowDeviceInfo);
++    view_commit_model(page->canvas_view, false);
+ 
+-    // Only handle the right button short press event when the handshake is successful
++    // Only handle the right/ok button short press event when the handshake is successful
+     // and the operate callback is set
+     if((event->type == InputTypeShort) &&
+-       (event->key == InputKeyRight || event->key == InputKeyOk) &&
+-       (model->state == MainPageShowDeviceInfo)) {
++       (event->key == InputKeyRight || event->key == InputKeyOk) && ready) {
+         page->operate_callback(page->operate_callback_context);
+         return true;
+     }
+@@ -91,23 +92,21 @@ static int32_t proxmark5_handshake_task(void* context) {
+     MainPage* page = context;
+     uint8_t phase = 0;
+ 
+-    while(1) {
+-        // If the thread is marked as not running, exit the loop
+-        if(!page->proxmark5_handshake_thread_running) {
+-            break;
+-        }
+-
++    while(page->proxmark5_handshake_thread_running) {
+         // Advance loading animation while waiting for handshake
+         phase = (phase + 1) % 4;
+-        MainPageModel* model = view_get_model(page->canvas_view);
+-        if(model->state == MainPageHandshakeRunning) {
+-            model->loading_phase = phase;
++        {
++            MainPageModel* model = view_get_model(page->canvas_view);
++            if(model->state == MainPageHandshakeRunning) {
++                model->loading_phase = phase;
++            }
+             view_commit_model(page->canvas_view, true);
+         }
+ 
+         // Try to perform the proxmark5 handshake, if successful, show the success message and exit the loop
+         if(proxmark5_com_handshake()) {
+             // Switch to the success state and update the view to show the success message
++            MainPageModel* model = view_get_model(page->canvas_view);
+             model->state = MainPageShowDeviceInfo;
+             view_commit_model(page->canvas_view, true);
+             FURI_LOG_I("proxmark5_handshake_task", "Proxmark5 handshake successful");
+@@ -196,6 +195,7 @@ MainPage*
+     model->page = main_page;
+     model->state = MainPageHandshakeRunning; // Default to the handshake running state
+     model->loading_phase = 0;
++    view_commit_model(main_page->canvas_view, false);
+ 
+     // Set the draw callback for the canvas view
+     view_set_draw_callback(main_page->canvas_view, fmps_cxt_canvas_draw_callback);
+diff --git a/pages/operate_page.c b/pages/operate_page.c
+index 6e8816e..79c108d 100644
+--- a/pages/operate_page.c
++++ b/pages/operate_page.c
+@@ -2,8 +2,16 @@
+ #include "operate_page.h"
+ 
+ typedef enum {
+-    OperateSubmenuIndexReadHitag2 = 0,
+-    OperateSubmenuIndexHf14a,
++    OperateSubmenuIndexHf14a = 0,
++    OperateSubmenuIndexHfMfAudit,
++    OperateSubmenuIndexHfSniff,
++    OperateSubmenuIndexHfMulti,
++    OperateSubmenuIndexT5577Suite,
++    OperateSubmenuIndexLfLab,
++    OperateSubmenuIndexReadHitag2,
++    OperateSubmenuIndexRfScope,
++    OperateSubmenuIndexAntennaTune,
++    OperateSubmenuIndexPm5Control,
+     OperateSubmenuIndexStatus,
+ } OperateSubmenuIndex;
+ 
+@@ -25,6 +33,49 @@ static void operate_page_submenu_callback(void* context, uint32_t index) {
+             operate_page->open_hf14a_callback(operate_page->open_hf14a_callback_context);
+         }
+         break;
++    case OperateSubmenuIndexHfMfAudit:
++        if(operate_page->open_hf_mf_audit_callback) {
++            operate_page->open_hf_mf_audit_callback(
++                operate_page->open_hf_mf_audit_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexHfSniff:
++        if(operate_page->open_hf_sniff_callback) {
++            operate_page->open_hf_sniff_callback(operate_page->open_hf_sniff_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexHfMulti:
++        if(operate_page->open_hf_multi_callback) {
++            operate_page->open_hf_multi_callback(operate_page->open_hf_multi_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexT5577Suite:
++        if(operate_page->open_t5577_suite_callback) {
++            operate_page->open_t5577_suite_callback(operate_page->open_t5577_suite_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexLfLab:
++        if(operate_page->open_lf_lab_callback) {
++            operate_page->open_lf_lab_callback(operate_page->open_lf_lab_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexRfScope:
++        if(operate_page->open_rf_scope_callback) {
++            operate_page->open_rf_scope_callback(operate_page->open_rf_scope_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexAntennaTune:
++        if(operate_page->open_antenna_tune_callback) {
++            operate_page->open_antenna_tune_callback(
++                operate_page->open_antenna_tune_callback_context);
++        }
++        break;
++    case OperateSubmenuIndexPm5Control:
++        if(operate_page->open_pm5_control_callback) {
++            operate_page->open_pm5_control_callback(
++                operate_page->open_pm5_control_callback_context);
++        }
++        break;
+     case OperateSubmenuIndexStatus:
+         if(operate_page->open_status_callback) {
+             operate_page->open_status_callback(operate_page->open_status_callback_context);
+@@ -36,11 +87,27 @@ static void operate_page_submenu_callback(void* context, uint32_t index) {
+ }
+ 
+ OperatePage* operate_page_create(
+-    OperatePageReadHitag2Callback open_read_hitag2_callback,
++    OperatePageCallback open_read_hitag2_callback,
+     void* open_read_hitag2_callback_context,
+-    OperatePageOpenHf14aCallback open_hf14a_callback,
++    OperatePageCallback open_hf14a_callback,
+     void* open_hf14a_callback_context,
+-    OperatePageOpenStatusCallback open_status_callback,
++    OperatePageCallback open_hf_mf_audit_callback,
++    void* open_hf_mf_audit_callback_context,
++    OperatePageCallback open_hf_sniff_callback,
++    void* open_hf_sniff_callback_context,
++    OperatePageCallback open_hf_multi_callback,
++    void* open_hf_multi_callback_context,
++    OperatePageCallback open_lf_lab_callback,
++    void* open_lf_lab_callback_context,
++    OperatePageCallback open_t5577_suite_callback,
++    void* open_t5577_suite_callback_context,
++    OperatePageCallback open_rf_scope_callback,
++    void* open_rf_scope_callback_context,
++    OperatePageCallback open_antenna_tune_callback,
++    void* open_antenna_tune_callback_context,
++    OperatePageCallback open_pm5_control_callback,
++    void* open_pm5_control_callback_context,
++    OperatePageCallback open_status_callback,
+     void* open_status_callback_context) {
+     OperatePage* operate_page = calloc(1, sizeof(OperatePage));
+     if(!operate_page) {
+@@ -51,21 +118,85 @@ OperatePage* operate_page_create(
+     operate_page->open_read_hitag2_callback_context = open_read_hitag2_callback_context;
+     operate_page->open_hf14a_callback = open_hf14a_callback;
+     operate_page->open_hf14a_callback_context = open_hf14a_callback_context;
++    operate_page->open_hf_mf_audit_callback = open_hf_mf_audit_callback;
++    operate_page->open_hf_mf_audit_callback_context = open_hf_mf_audit_callback_context;
++    operate_page->open_hf_sniff_callback = open_hf_sniff_callback;
++    operate_page->open_hf_sniff_callback_context = open_hf_sniff_callback_context;
++    operate_page->open_hf_multi_callback = open_hf_multi_callback;
++    operate_page->open_hf_multi_callback_context = open_hf_multi_callback_context;
++    operate_page->open_lf_lab_callback = open_lf_lab_callback;
++    operate_page->open_lf_lab_callback_context = open_lf_lab_callback_context;
++    operate_page->open_t5577_suite_callback = open_t5577_suite_callback;
++    operate_page->open_t5577_suite_callback_context = open_t5577_suite_callback_context;
++    operate_page->open_rf_scope_callback = open_rf_scope_callback;
++    operate_page->open_rf_scope_callback_context = open_rf_scope_callback_context;
++    operate_page->open_antenna_tune_callback = open_antenna_tune_callback;
++    operate_page->open_antenna_tune_callback_context = open_antenna_tune_callback_context;
++    operate_page->open_pm5_control_callback = open_pm5_control_callback;
++    operate_page->open_pm5_control_callback_context = open_pm5_control_callback_context;
+     operate_page->open_status_callback = open_status_callback;
+     operate_page->open_status_callback_context = open_status_callback_context;
+ 
+     operate_page->submenu = submenu_alloc();
+-    submenu_set_header(operate_page->submenu, "Functions Menu");
++    submenu_set_header(operate_page->submenu, "PM5 Companion v2.0");
++    submenu_add_item(
++        operate_page->submenu,
++        "HF 14a & Magic Lab",
++        OperateSubmenuIndexHf14a,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "MFC Key Auditor (1K)",
++        OperateSubmenuIndexHfMfAudit,
++        operate_page_submenu_callback,
++        operate_page);
+     submenu_add_item(
+         operate_page->submenu,
+-        "ReadHitag2",
++        "14a Air Sniffer",
++        OperateSubmenuIndexHfSniff,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "HF 15693 / iCLASS",
++        OperateSubmenuIndexHfMulti,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "T5577 & EM4100 Master",
++        OperateSubmenuIndexT5577Suite,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "LF Multi-Cloner Lab",
++        OperateSubmenuIndexLfLab,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "LF Hitag2 Reader",
+         OperateSubmenuIndexReadHitag2,
+         operate_page_submenu_callback,
+         operate_page);
+     submenu_add_item(
+         operate_page->submenu,
+-        "HF 14a Reader",
+-        OperateSubmenuIndexHf14a,
++        "Live RF Field Scope",
++        OperateSubmenuIndexRfScope,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "Antenna Tuner & Graph",
++        OperateSubmenuIndexAntennaTune,
++        operate_page_submenu_callback,
++        operate_page);
++    submenu_add_item(
++        operate_page->submenu,
++        "PM5 Hardware Control",
++        OperateSubmenuIndexPm5Control,
+         operate_page_submenu_callback,
+         operate_page);
+     submenu_add_item(
+diff --git a/pages/operate_page.h b/pages/operate_page.h
+index 04d5738..d3f0cbe 100644
+--- a/pages/operate_page.h
++++ b/pages/operate_page.h
+@@ -3,27 +3,57 @@
+ 
+ #include <gui/modules/submenu.h>
+ 
+-typedef void (*OperatePageReadHitag2Callback)(void* context);
+-typedef void (*OperatePageOpenHf14aCallback)(void* context);
+-typedef void (*OperatePageOpenStatusCallback)(void* context);
++typedef void (*OperatePageCallback)(void* context);
+ 
+ typedef struct {
+     Submenu* submenu;
+ 
+-    OperatePageReadHitag2Callback open_read_hitag2_callback;
++    OperatePageCallback open_read_hitag2_callback;
+     void* open_read_hitag2_callback_context;
+-    OperatePageOpenHf14aCallback open_hf14a_callback;
++    OperatePageCallback open_hf14a_callback;
+     void* open_hf14a_callback_context;
+-    OperatePageOpenStatusCallback open_status_callback;
++    OperatePageCallback open_hf_mf_audit_callback;
++    void* open_hf_mf_audit_callback_context;
++    OperatePageCallback open_hf_sniff_callback;
++    void* open_hf_sniff_callback_context;
++    OperatePageCallback open_hf_multi_callback;
++    void* open_hf_multi_callback_context;
++    OperatePageCallback open_lf_lab_callback;
++    void* open_lf_lab_callback_context;
++    OperatePageCallback open_t5577_suite_callback;
++    void* open_t5577_suite_callback_context;
++    OperatePageCallback open_rf_scope_callback;
++    void* open_rf_scope_callback_context;
++    OperatePageCallback open_antenna_tune_callback;
++    void* open_antenna_tune_callback_context;
++    OperatePageCallback open_pm5_control_callback;
++    void* open_pm5_control_callback_context;
++    OperatePageCallback open_status_callback;
+     void* open_status_callback_context;
+ } OperatePage;
+ 
+ OperatePage* operate_page_create(
+-    OperatePageReadHitag2Callback open_read_hitag2_callback,
++    OperatePageCallback open_read_hitag2_callback,
+     void* open_read_hitag2_callback_context,
+-    OperatePageOpenHf14aCallback open_hf14a_callback,
++    OperatePageCallback open_hf14a_callback,
+     void* open_hf14a_callback_context,
+-    OperatePageOpenStatusCallback open_status_callback,
++    OperatePageCallback open_hf_mf_audit_callback,
++    void* open_hf_mf_audit_callback_context,
++    OperatePageCallback open_hf_sniff_callback,
++    void* open_hf_sniff_callback_context,
++    OperatePageCallback open_hf_multi_callback,
++    void* open_hf_multi_callback_context,
++    OperatePageCallback open_lf_lab_callback,
++    void* open_lf_lab_callback_context,
++    OperatePageCallback open_t5577_suite_callback,
++    void* open_t5577_suite_callback_context,
++    OperatePageCallback open_rf_scope_callback,
++    void* open_rf_scope_callback_context,
++    OperatePageCallback open_antenna_tune_callback,
++    void* open_antenna_tune_callback_context,
++    OperatePageCallback open_pm5_control_callback,
++    void* open_pm5_control_callback_context,
++    OperatePageCallback open_status_callback,
+     void* open_status_callback_context);
+ void operate_page_free(OperatePage* operate_page);
+ 
+diff --git a/pages/status_page.c b/pages/status_page.c
+index 42285bb..77ec9ef 100644
+--- a/pages/status_page.c
++++ b/pages/status_page.c
+@@ -91,7 +91,10 @@ static void status_page_draw_callback(Canvas* canvas, void* context) {
+ 
+     if(model->ui_state == StatusPageStateReady) {
+         elements_button_left(canvas, "Prev");
++        elements_button_center(canvas, "Refresh");
+         elements_button_right(canvas, "Next");
++    } else if(model->ui_state == StatusPageStateUnreachable) {
++        elements_button_center(canvas, "Retry");
+     }
+ }
+ 
+@@ -116,6 +119,13 @@ static bool status_page_input_callback(InputEvent* event, void* context) {
+         return changed;
+     }
+ 
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!status_page->worker_thread_running) {
++            status_page_start(status_page);
++            return true;
++        }
++    }
++
+     return false;
+ }
+ 
+@@ -198,35 +208,42 @@ static int32_t status_page_worker(void* context) {
+     }
+ 
+     count = 0;
+-    status_test_battery_fetch(cancel, lines, &count);
+-    if(status_page_worker_check_cancel(status_page)) {
+-        furi_thread_list_free(thread_list);
+-        return 0;
+-    }
+-    if(count >= 1) {
+-        memcpy(rows[1][0], lines[0], STATUS_PAGE_LINE_LEN);
+-    }
+-    if(count >= 2) {
+-        memcpy(rows[1][1], lines[1], STATUS_PAGE_LINE_LEN);
+-    }
+-    if(count >= 3) {
+-        memcpy(rows[1][2], lines[2], STATUS_PAGE_LINE_LEN);
+-    }
+-    {
+-        // Fault's index isn't fixed (Health may or may not precede it) -
+-        // find it by prefix. Shown in place of Temp when present, since a
+-        // real fault is more actionable than ambient temperature.
+-        const char* fault_line = NULL;
+-        for(int i = 4; i < count; i++) {
+-            if(strncmp(lines[i], "Fault:", 6) == 0) {
+-                fault_line = lines[i];
+-                break;
+-            }
++    if(strstr(rows[0][0], "BWM:   n") != NULL) {
++        // Firmware compiled without PLATFORM_EXTRAS=BWM: skip CMD_PM5_BWM_GET_BATTERY
++        // (0x0184 is not compiled in and would time out for 3s).
++        snprintf(rows[1][0], STATUS_PAGE_LINE_LEN, "BWM:   Not installed");
++        snprintf(rows[1][1], STATUS_PAGE_LINE_LEN, "Power:   USB / CEP 5V");
++    } else {
++        status_test_battery_fetch(cancel, lines, &count);
++        if(status_page_worker_check_cancel(status_page)) {
++            furi_thread_list_free(thread_list);
++            return 0;
++        }
++        if(count >= 1) {
++            memcpy(rows[1][0], lines[0], STATUS_PAGE_LINE_LEN);
+         }
+-        if(fault_line) {
+-            memcpy(rows[1][3], fault_line, STATUS_PAGE_LINE_LEN);
+-        } else if(count >= 4) {
+-            memcpy(rows[1][3], lines[3], STATUS_PAGE_LINE_LEN);
++        if(count >= 2) {
++            memcpy(rows[1][1], lines[1], STATUS_PAGE_LINE_LEN);
++        }
++        if(count >= 3) {
++            memcpy(rows[1][2], lines[2], STATUS_PAGE_LINE_LEN);
++        }
++        {
++            // Fault's index isn't fixed (Health may or may not precede it) -
++            // find it by prefix. Shown in place of Temp when present, since a
++            // real fault is more actionable than ambient temperature.
++            const char* fault_line = NULL;
++            for(int i = 4; i < count; i++) {
++                if(strncmp(lines[i], "Fault:", 6) == 0) {
++                    fault_line = lines[i];
++                    break;
++                }
++            }
++            if(fault_line) {
++                memcpy(rows[1][3], fault_line, STATUS_PAGE_LINE_LEN);
++            } else if(count >= 4) {
++                memcpy(rows[1][3], lines[3], STATUS_PAGE_LINE_LEN);
++            }
+         }
+     }
+ 
+@@ -263,6 +280,14 @@ static int32_t status_page_worker(void* context) {
+ 
+     furi_thread_enumerate(thread_list);
+     uint32_t stats_window_ms = furi_get_tick() - stats_start_tick;
++    FURI_LOG_I(
++        "PM5_QA_Status",
++        "OK: [%s] [%s] [%s] [%s] [%s]",
++        rows[0][0],
++        rows[0][1],
++        rows[2][0],
++        rows[2][1],
++        rows[2][2]);
+     float spi_rx_cpu = 0.0f;
+     for(size_t i = 0; i < furi_thread_list_size(thread_list); i++) {
+         FuriThreadListItem* item = furi_thread_list_get_at(thread_list, i);
+diff --git a/pages/status_page_tests.c b/pages/status_page_tests.c
+index cd0a69b..90c8e4b 100644
+--- a/pages/status_page_tests.c
++++ b/pages/status_page_tests.c
+@@ -1,6 +1,7 @@
+ #include <furi.h>
+ #include <string.h>
+ #include "status_page_tests.h"
++#include "proxmark5_com.h"
+ #include "proxmark5_frame.h"
+ #include "pm3_cmd.h"
+ 
+@@ -43,7 +44,10 @@ static int status_test_send_and_wait(
+     PacketResponseNG* resp,
+     uint32_t timeout_ms,
+     volatile bool* cancel_requested) {
+-    for(int attempt = 0; attempt < 2; attempt++) {
++    for(int attempt = 0; attempt < 3; attempt++) {
++        if(attempt > 0) {
++            proxmark5_com_handshake();
++        }
+         clearCommandBuffer();
+         if(cancel_requested && *cancel_requested) {
+             return PM3_EOPABORTED;
+@@ -54,6 +58,7 @@ static int status_test_send_and_wait(
+         if(result != PM3_ETIMEOUT) {
+             return result;
+         }
++        furi_delay_ms(15);
+     }
+     return PM3_ETIMEOUT;
+ }
+-- 
+2.56.0
+

@@ -1,0 +1,472 @@
+From 9ad2c9b7d632b6d06660b696a30b45512701f68e Mon Sep 17 00:00:00 2001
+From: MrBoogus <90836807+MrBoogus@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:18:24 +0300
+Subject: [PATCH 1/4] driver: add PM3 command definitions, break-loop control,
+ and Dbprintf log ring
+
+- Add command opcodes in pm3_cmd.h for ISO14443A reader/sniffer/chkkeys/readsc,
+  Mifare Classic, ISO15693, iClass, LF EM410x, HID Prox, T55xx read/write/snoop,
+  antenna voltage sweep, and PM5 hardware control.
+- Implement proxmark5_com_set_break_loop() sending 0x55 sync poll bytes to
+  cleanly break continuous PM5 operations without desynchronizing the bus.
+- Add an ANSI-stripped Dbprintf ring buffer to capture and surface PM5 firmware
+  CMD_DEBUG_PRINT_STRING (0x0100) frames to UI pages.
+- Add SPI bus activity tracking and busy state guards.
+---
+ lib/proxmark5_driver/pm3_cmd.h         | 102 +++++++++++++++++++++++++
+ lib/proxmark5_driver/proxmark5_com.c   |  89 +++++++++++++++++----
+ lib/proxmark5_driver/proxmark5_com.h   |  11 +++
+ lib/proxmark5_driver/proxmark5_frame.c |  43 +++++++++++
+ lib/proxmark5_driver/proxmark5_frame.h |   3 +
+ lib/proxmark5_driver/proxmark5_spi.c   |   8 ++
+ lib/proxmark5_driver/proxmark5_spi.h   |   5 ++
+ 7 files changed, 246 insertions(+), 15 deletions(-)
+
+diff --git a/lib/proxmark5_driver/pm3_cmd.h b/lib/proxmark5_driver/pm3_cmd.h
+index 82a6538..cd8241b 100644
+--- a/lib/proxmark5_driver/pm3_cmd.h
++++ b/lib/proxmark5_driver/pm3_cmd.h
+@@ -371,6 +371,81 @@ typedef struct {
+     uint8_t key[6];
+ } PACKED mfc_eload_t;
+ 
++typedef struct {
++    uint8_t sectorno;
++    uint8_t keytype;
++    uint8_t key[6];
++} PACKED mf_readsector_t;
++
++typedef struct {
++    uint8_t params;
++    uint8_t blockno;
++    uint8_t data[];
++} PACKED mf_chinese_blk_t;
++
++typedef struct {
++    uint8_t is_mfc;
++    uint8_t keytype;
++    uint8_t key[6];
++} PACKED mf_chinese_ident_t;
++
++typedef struct {
++    uint8_t uidlen;
++    uint8_t uid[];
++} PACKED mf_gen3uid_t;
++
++typedef struct {
++    uint8_t blocklen;
++    uint8_t block[];
++} PACKED mf_gen3blk_t;
++
++typedef struct {
++    uint32_t start_index;
++    uint32_t bytes;
++    uint8_t data[];
++} PACKED download_req_t;
++
++typedef struct {
++    uint32_t offset;
++    uint8_t data[];
++} PACKED download_chunk_t;
++
++typedef struct {
++    uint32_t bytes_sent;
++    uint32_t extra;
++} PACKED download_done_t;
++
++#define MAGIC_UID                   0x01
++#define MAGIC_WUPC                  0x02
++#define MAGIC_HALT                  0x04
++#define MAGIC_INIT                  0x08
++#define MAGIC_OFF                   0x10
++#define MAGIC_DATAIN                0x20
++#define MAGIC_WIPE                  0x40
++#define MAGIC_GDM_ALT_WUPC          0x80
++#define MAGIC_SINGLE                (MAGIC_HALT | MAGIC_INIT | MAGIC_OFF)
++
++#define MAGIC_FLAG_NONE            0x0000
++#define MAGIC_FLAG_GEN_1A          0x0001
++#define MAGIC_FLAG_GEN_1B          0x0002
++#define MAGIC_FLAG_GEN_2           0x0004
++#define MAGIC_FLAG_GEN_UNFUSED     0x0008
++#define MAGIC_FLAG_SUPER_GEN1      0x0010
++#define MAGIC_FLAG_SUPER_GEN2      0x0020
++#define MAGIC_FLAG_NTAG21X         0x0040
++#define MAGIC_FLAG_GEN_3           0x0080
++#define MAGIC_FLAG_GEN_4GTU        0x0100
++#define MAGIC_FLAG_GDM_AUTH        0x0200
++#define MAGIC_FLAG_QL88            0x0400
++#define MAGIC_FLAG_GDM_WUP_20      0x0800
++#define MAGIC_FLAG_GDM_WUP_40      0x1000
++#define MAGIC_FLAG_GDM_WUP_40_ZUID 0x2000
++
++#define ISO14443A_CMD_READBLOCK     0x30
++#define ISO14443A_CMD_WRITEBLOCK    0xA0
++#define MIFARE_AUTH_KEYA            0x60
++#define MIFARE_AUTH_KEYB            0x61
++
+ typedef struct {
+     bool use_flashmem;
+     uint16_t keycount;
+@@ -1188,4 +1263,31 @@ typedef struct {
+     uint8_t  data[];
+ } PACKED iso14a_raw_resp_t;
+ 
++// PM5 Hardware Control Commands (Smart Antenna, RGB LEDs, Power Save)
++#define CMD_ANT_CONTROL_WRITE   0x0170
++#define CMD_ANT_CONTROL_READ    0x0171
++#define CMD_PM5_RGB_SET         0x0178
++#define CMD_PM5_POWERSAVE       0x0180
++
++#define PM5_ANT_I2C_ADDR        0x51
++#define PM5_ANT_CTRL_REG        0x02
++
++#define ICLASS_READER_OPT_LEFT  0x01
++
++typedef struct {
++    uint8_t mode;
++    uint8_t scale;
++    uint8_t r;
++    uint8_t g;
++    uint8_t b;
++    uint8_t brightness;
++    uint8_t start_r;
++    uint8_t start_g;
++    uint8_t start_b;
++    uint8_t end_r;
++    uint8_t end_g;
++    uint8_t end_b;
++    uint16_t step_ms;
++} PACKED pm5_rgb_ctrl_t;
++
+ #endif
+diff --git a/lib/proxmark5_driver/proxmark5_com.c b/lib/proxmark5_driver/proxmark5_com.c
+index 174ccaa..18e1bb4 100644
+--- a/lib/proxmark5_driver/proxmark5_com.c
++++ b/lib/proxmark5_driver/proxmark5_com.c
+@@ -19,6 +19,7 @@ typedef struct {
+     volatile bool handshake_waiting;
+     volatile bool handshake_matched;
+     uint8_t handshake_state;
++    bool otg_attempted;
+ 
+     // Thread for handling SPI communication
+     FuriThread* thread_rx_spi;
+@@ -27,6 +28,7 @@ typedef struct {
+     // Tick of the last send attempt; RX poll uses a short-sleep window
+     // right after, since a reply typically lands within tens of ms.
+     volatile uint32_t last_send_tick;
++    volatile bool break_loop_active;
+ 
+     // RX packet buffer stored in context (heap-backed via com_context)
+     uint8_t packet[BUFFER_SIZE];
+@@ -113,7 +115,9 @@ static int32_t proxmark5_com_spi_task(void* context) {
+         // every CS edge, so splitting desyncs the two sides.
+         proxmark5_spi_acquire();
+ 
+-        if(!proxmark5_spi_trx_raw(spi_len_header, sizeof(spi_len_header), 100)) {
++        static const uint8_t k_break_tx[2] = {0x55, 0x55};
++        const uint8_t* poll_tx = com_context->break_loop_active ? k_break_tx : NULL;
++        if(!proxmark5_spi_trx_bytes_raw(poll_tx, spi_len_header, sizeof(spi_len_header), 100)) {
+             proxmark5_spi_release();
+             furi_delay_ms(fast ? FAST_POLL_PENALTY_MS : PENALTY_POLL_MS);
+             continue;
+@@ -130,6 +134,7 @@ static int32_t proxmark5_com_spi_task(void* context) {
+         }
+ 
+         FURI_LOG_I(PROXMARK5_LOG_TAG, "Data length to receive: %u", data_length);
++        com_context->break_loop_active = false;
+ 
+         bool got_payload = proxmark5_spi_trx_raw(com_context->packet, data_length, 2000);
+         proxmark5_spi_release();
+@@ -191,7 +196,9 @@ void proxmark5_com_init(void) {
+     com_context->handshake_waiting = false;
+     com_context->handshake_matched = false;
+     com_context->handshake_state = 0;
++    com_context->otg_attempted = false;
+     com_context->last_send_tick = furi_get_tick() - FAST_POLL_WINDOW_MS;
++    com_context->break_loop_active = false;
+ 
+     proxmark5_frame_init();
+ 
+@@ -239,12 +246,20 @@ bool proxmark5_com_handshake(void) {
+     // furi_delay_ms(500);
+     // return false;
+ 
+-    // If OTG is not enabled, enable it to power the proxmark5(5v)
++    // If OTG is not enabled, try enabling it to power the proxmark5 (5V)
+     if(!furi_hal_power_is_otg_enabled()) {
+-        furi_hal_power_enable_otg();
+-        // Wait for proxmark5 to power on and be ready
+-        furi_delay_ms(500);
+-        FURI_LOG_I(PROXMARK5_LOG_TAG, "OTG enabled to power proxmark5");
++        bool otg_ok = furi_hal_power_enable_otg();
++        if(!com_context->otg_attempted) {
++            com_context->otg_attempted = true;
++            if(otg_ok) {
++                furi_delay_ms(500);
++                FURI_LOG_I(PROXMARK5_LOG_TAG, "OTG 5V enabled to power proxmark5");
++            } else {
++                FURI_LOG_W(
++                    PROXMARK5_LOG_TAG,
++                    "OTG 5V unavailable (Flipper USB VBUS connected); PM5 needs external/BWM power");
++            }
++        }
+     }
+ 
+     // Check IDLE or disconnected.
+@@ -260,17 +275,23 @@ bool proxmark5_com_handshake(void) {
+     com_context->handshake_matched = false;
+     com_context->handshake_state = 0;
+ 
+-    // Send a simple start byte to wakeup/reset proxmark5
++    // 1) Send STX wake byte first and wait >50ms so PM5's cep_attach_poll()
++    //    (which runs every 50ms) sees USART_RDBF_FLAG and enters cep_do_handshake().
++    proxmark5_uart_send_byte(0x02);
++    furi_delay_ms(65);
++
++    // 2) Now that PM5 is actively polling USART1 in cep_do_handshake(),
++    //    send STX + handshake string and switch SPI RX into fast-poll mode.
++    com_context->last_send_tick = furi_get_tick();
+     proxmark5_uart_send_byte(0x02);
+-    // Send a simple handshake message over UART
+     proxmark5_uart_send_string(PROXMARK5_UART_HANDSHAKE_MSG);
+ 
+     // Wait for proxmark5 to process the handshake message
+-    furi_delay_ms(100);
++    furi_delay_ms(50);
+ 
+     // Start time
+     uint32_t start_time = furi_get_tick();
+-    while(furi_get_tick() - start_time < 1000) { // 1 second timeout for handshake response
++    while(furi_get_tick() - start_time < 800) {
+         if(com_context->handshake_matched) {
+             return true;
+         }
+@@ -296,7 +317,20 @@ bool proxmark5_com_handshake(void) {
+ // so PM5's polled SPI1 reception has a wide enough window to notice the
+ // frame start. Must match armsrc/pm5_cep.c's cep_spi_data_available().
+ #define SYNC_BYTE 0x55
+-#define SYNC_LEN  500 // ~2ms at 2MHz
++#define SYNC_LEN  580 // ~2.3ms at 2MHz (safely under PM5's CEP_SYNC_MAX_DISCARD = 600)
++
++void proxmark5_com_keep_fast_poll(void) {
++    if(com_context != NULL) {
++        com_context->last_send_tick = furi_get_tick();
++    }
++}
++
++void proxmark5_com_set_break_loop(bool active) {
++    if(com_context != NULL) {
++        com_context->break_loop_active = active;
++        com_context->last_send_tick = furi_get_tick();
++    }
++}
+ 
+ bool proxmark5_com_send_spi(uint8_t* data, size_t length) {
+     if(com_context == NULL || data == NULL || length == 0 || length > BUFFER_SIZE) {
+@@ -305,18 +339,17 @@ bool proxmark5_com_send_spi(uint8_t* data, size_t length) {
+ 
+     com_context->last_send_tick = furi_get_tick();
+ 
+-    // Build preamble + length header + payload + trailer in one buffer and
++    // Build preamble + length header + payload in one buffer and
+     // send it as a single tx call - splitting the transfer desyncs PM5's
+     // HW-CS slave mode, same as the RX side.
+-    uint8_t frame_buf[SYNC_LEN + 2 + BUFFER_SIZE + 1];
++    uint8_t frame_buf[SYNC_LEN + 2 + BUFFER_SIZE];
+     memset(frame_buf, SYNC_BYTE, SYNC_LEN);
+     frame_buf[SYNC_LEN + 0] = (uint8_t)(length & 0xFF);
+     frame_buf[SYNC_LEN + 1] = (uint8_t)((length >> 8) & 0xFF);
+     memcpy(frame_buf + SYNC_LEN + 2, data, length);
+-    frame_buf[SYNC_LEN + 2 + length] = 0x00; // DXL: last byte must be 0x00 to keep the proxmark5 no data rx.
+ 
+     proxmark5_spi_acquire();
+-    bool ok = proxmark5_spi_tx_raw(frame_buf, SYNC_LEN + 2 + length + 1, 1000);
++    bool ok = proxmark5_spi_tx_raw(frame_buf, SYNC_LEN + 2 + length, 1000);
+     proxmark5_spi_release();
+ 
+     if(!ok) {
+@@ -324,3 +357,29 @@ bool proxmark5_com_send_spi(uint8_t* data, size_t length) {
+     }
+     return ok;
+ }
++
++bool proxmark5_com_request_ng(
++    uint16_t req_cmd,
++    uint8_t* data,
++    size_t len,
++    uint16_t resp_cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    uint8_t max_attempts) {
++    if(max_attempts == 0) {
++        max_attempts = 1;
++    }
++    for(uint8_t attempt = 0; attempt < max_attempts; attempt++) {
++        if(attempt > 0) {
++            // Re-establish CEP active state in case PM5's 3s CEP_ACTIVITY_TIMEOUT_MS expired
++            proxmark5_com_handshake();
++        }
++        clearCommandBuffer();
++        SendCommandNG(req_cmd, data, len);
++        if(WaitForResponseTimeout(resp_cmd, resp, timeout_ms)) {
++            return true;
++        }
++        furi_delay_ms(15);
++    }
++    return false;
++}
+diff --git a/lib/proxmark5_driver/proxmark5_com.h b/lib/proxmark5_driver/proxmark5_com.h
+index 22ea02b..d1dae60 100644
+--- a/lib/proxmark5_driver/proxmark5_com.h
++++ b/lib/proxmark5_driver/proxmark5_com.h
+@@ -4,10 +4,21 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include "pm3_cmd.h"
+ 
+ void proxmark5_com_init(void);
+ void proxmark5_com_deinit(void);
+ bool proxmark5_com_handshake(void);
++void proxmark5_com_keep_fast_poll(void);
++void proxmark5_com_set_break_loop(bool active);
+ bool proxmark5_com_send_spi(uint8_t* data, size_t length);
++bool proxmark5_com_request_ng(
++    uint16_t req_cmd,
++    uint8_t* data,
++    size_t len,
++    uint16_t resp_cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    uint8_t max_attempts);
+ 
+ #endif // proxmark5_COM_H
+diff --git a/lib/proxmark5_driver/proxmark5_frame.c b/lib/proxmark5_driver/proxmark5_frame.c
+index 3e77d9b..4937735 100644
+--- a/lib/proxmark5_driver/proxmark5_frame.c
++++ b/lib/proxmark5_driver/proxmark5_frame.c
+@@ -18,6 +18,8 @@ typedef struct {
+     PacketResponseNG cache[PM3_RESPONSE_CACHE_SIZE];
+     uint8_t head;
+     uint8_t tail;
++    char last_log[160];
++    bool has_new_log;
+     // The SPI RX thread enqueues while worker threads take; the ring needs a lock.
+     FuriMutex* mutex;
+ } Proxmark5FrameContext;
+@@ -86,6 +88,28 @@ static void proxmark5_frame_log_print_string(uint8_t* data, size_t length, uint1
+     memcpy(log_message, data, copy_len);
+     log_message[copy_len] = '\0';
+ 
++    // Store ANSI-stripped copy in frame_context.last_log for UI pages (e.g. LF watch)
++    proxmark5_frame_lock();
++    size_t out_idx = 0;
++    for(size_t i = 0; i < copy_len && out_idx + 1U < sizeof(frame_context.last_log); i++) {
++        if(log_message[i] == '\x1b' && (i + 1U) < copy_len && log_message[i + 1U] == '[') {
++            i += 2U;
++            while(i < copy_len && log_message[i] != 'm' &&
++                  ((log_message[i] >= '0' && log_message[i] <= '9') || log_message[i] == ';')) {
++                i++;
++            }
++            continue;
++        }
++        if(log_message[i] >= 0x20 && log_message[i] <= 0x7E) {
++            frame_context.last_log[out_idx++] = log_message[i];
++        }
++    }
++    if(out_idx > 0) {
++        frame_context.last_log[out_idx] = '\0';
++        frame_context.has_new_log = true;
++    }
++    proxmark5_frame_unlock();
++
+     if(flag & PM3_FLAG_LOG) {
+         FURI_LOG_I(PROXMARK5_LOG_TAG, "[#] %s", log_message);
+     } else if(flag & PM3_FLAG_INPLACE) {
+@@ -275,7 +299,25 @@ void proxmark5_frame_reset(void) {
+     proxmark5_frame_lock();
+     frame_context.head = 0;
+     frame_context.tail = 0;
++    frame_context.has_new_log = false;
++    frame_context.last_log[0] = '\0';
++    proxmark5_frame_unlock();
++}
++
++bool proxmark5_frame_pop_log(char* out, size_t max_len) {
++    if(out == NULL || max_len == 0) {
++        return false;
++    }
++    proxmark5_frame_lock();
++    if(!frame_context.has_new_log) {
++        proxmark5_frame_unlock();
++        return false;
++    }
++    strncpy(out, frame_context.last_log, max_len - 1U);
++    out[max_len - 1U] = '\0';
++    frame_context.has_new_log = false;
+     proxmark5_frame_unlock();
++    return true;
+ }
+ 
+ void clearCommandBuffer(void) {
+@@ -367,6 +409,7 @@ bool WaitForResponseTimeout(uint16_t cmd, PacketResponseNG* packet, uint32_t tim
+     uint32_t start_time = furi_get_tick();
+ 
+     while((furi_get_tick() - start_time) < timeout_ms) {
++        proxmark5_com_keep_fast_poll();
+         if(proxmark5_frame_take_by_cmd(cmd, packet)) {
+             return true;
+         }
+diff --git a/lib/proxmark5_driver/proxmark5_frame.h b/lib/proxmark5_driver/proxmark5_frame.h
+index cda2d2b..3dfca8a 100644
+--- a/lib/proxmark5_driver/proxmark5_frame.h
++++ b/lib/proxmark5_driver/proxmark5_frame.h
+@@ -23,6 +23,9 @@ bool proxmark5_frame_get_response(PacketResponseNG* packet);
+ // Take first cached response that matches cmd. Returns false if no matched cmd.
+ bool proxmark5_frame_take_by_cmd(uint16_t cmd, PacketResponseNG* packet);
+ 
++// Pop the most recent debug print string (ANSI-stripped). Returns false if none since last pop/reset.
++bool proxmark5_frame_pop_log(char* out, size_t max_len);
++
+ void clearCommandBuffer(void);
+ 
+ void SendCommandOLD(
+diff --git a/lib/proxmark5_driver/proxmark5_spi.c b/lib/proxmark5_driver/proxmark5_spi.c
+index a09f271..2cd04ce 100644
+--- a/lib/proxmark5_driver/proxmark5_spi.c
++++ b/lib/proxmark5_driver/proxmark5_spi.c
+@@ -76,6 +76,14 @@ bool proxmark5_spi_trx_raw(uint8_t* buffer, size_t length, uint32_t timeout) {
+     return furi_hal_spi_bus_trx(spi_bus, NULL, buffer, length, timeout);
+ }
+ 
++bool proxmark5_spi_trx_bytes_raw(
++    const uint8_t* tx_data,
++    uint8_t* rx_buffer,
++    size_t length,
++    uint32_t timeout) {
++    return furi_hal_spi_bus_trx(spi_bus, (uint8_t*)tx_data, rx_buffer, length, timeout);
++}
++
+ /**
+  * @brief Receive data over SPI from proxmark5, will release the bus after reception
+  * 
+diff --git a/lib/proxmark5_driver/proxmark5_spi.h b/lib/proxmark5_driver/proxmark5_spi.h
+index 51888f8..84c052b 100644
+--- a/lib/proxmark5_driver/proxmark5_spi.h
++++ b/lib/proxmark5_driver/proxmark5_spi.h
+@@ -18,5 +18,10 @@ void proxmark5_spi_acquire(void);
+ void proxmark5_spi_release(void);
+ bool proxmark5_spi_tx_raw(uint8_t* data, size_t length, uint32_t timeout);
+ bool proxmark5_spi_trx_raw(uint8_t* buffer, size_t length, uint32_t timeout);
++bool proxmark5_spi_trx_bytes_raw(
++    const uint8_t* tx_data,
++    uint8_t* rx_buffer,
++    size_t length,
++    uint32_t timeout);
+ 
+ #endif // proxmark5_SPI_H
+-- 
+2.56.0
+

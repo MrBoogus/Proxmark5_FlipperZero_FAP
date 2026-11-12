@@ -1,0 +1,2497 @@
+From 7286a0bf5d25898574f2cfbdbc357249403d2130 Mon Sep 17 00:00:00 2001
+From: MrBoogus <90836807+MrBoogus@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:18:41 +0300
+Subject: [PATCH 3/4] hf: add Magic card detection, MFC auditor, air sniffer,
+ and ISO15693/iClass
+
+- In read_hf14a_page: add Magic card identification (Gen1a, Gen1b, Gen2/CUID,
+  Gen3 APDU, Gen4 GTU/GDM, Magic NTAG, SuperCard), static nonce detection,
+  direct Flipper native NFC export (/ext/nfc/PM5_<UID>.nfc), and Magic cloner.
+- Add hf_mf_audit_page: hardware-accelerated MIFARE Classic 1K dictionary auditor
+  with interactive 16-sector visual key matrix and complete sector dump export.
+- Add hf_sniff_page: FPGA air sniffer for passive ISO14443A captures with trace
+  download, protocol frame parser (R> Reader / T< Tag), and raw trace export.
+- Add read_hf_multi_page: dual-mode HF reader for ISO15693 (NFC-V) 8-byte UID
+  and HID iClass / PicoPass CSN and e-Purse CC.
+---
+ pages/hf_mf_audit_page.c   | 655 +++++++++++++++++++++++++++++++++++++
+ pages/hf_mf_audit_page.h   |  16 +
+ pages/hf_sniff_page.c      | 533 ++++++++++++++++++++++++++++++
+ pages/hf_sniff_page.h      |  15 +
+ pages/read_hf14a_page.c    | 514 +++++++++++++++++++++++++----
+ pages/read_hf_multi_page.c | 492 ++++++++++++++++++++++++++++
+ pages/read_hf_multi_page.h |  16 +
+ 7 files changed, 2183 insertions(+), 58 deletions(-)
+ create mode 100644 pages/hf_mf_audit_page.c
+ create mode 100644 pages/hf_mf_audit_page.h
+ create mode 100644 pages/hf_sniff_page.c
+ create mode 100644 pages/hf_sniff_page.h
+ create mode 100644 pages/read_hf_multi_page.c
+ create mode 100644 pages/read_hf_multi_page.h
+
+diff --git a/pages/hf_mf_audit_page.c b/pages/hf_mf_audit_page.c
+new file mode 100644
+index 0000000..bad2f74
+--- /dev/null
++++ b/pages/hf_mf_audit_page.c
+@@ -0,0 +1,655 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <storage/storage.h>
++#include <stdio.h>
++#include <string.h>
++#include "hf_mf_audit_page.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++#define MFC_NUM_SECTORS 16U
++
++typedef enum {
++    HfMfAuditStateIdle,
++    HfMfAuditStateRunning,
++    HfMfAuditStateDumping,
++    HfMfAuditStateDone,
++    HfMfAuditStateNoCard,
++    HfMfAuditStateError,
++} HfMfAuditState;
++
++typedef enum {
++    HfMfWorkerTaskAudit = 0,
++    HfMfWorkerTaskDump = 1,
++} HfMfWorkerTask;
++
++typedef struct {
++    bool found_a;
++    bool found_b;
++    uint8_t key_a[6];
++    uint8_t key_b[6];
++} MfcSectorKeys;
++
++typedef struct {
++    HfMfAuditState state;
++    iso14a_card_select_t card;
++    uint8_t current_sector;
++    uint8_t scroll_sector;
++    uint8_t total_keys_found;
++    MfcSectorKeys sectors[MFC_NUM_SECTORS];
++    char status_msg[48];
++} HfMfAuditModel;
++
++struct HfMfAuditPage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_running;
++    volatile bool cancel_requested;
++    HfMfWorkerTask worker_task;
++
++    HfMfAuditPageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static const uint8_t k_mfc_default_keys[][6] = {
++    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, // Transport default
++    {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}, // MAD Key A
++    {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5}, // MAD Key B
++    {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7}, // NDEF Key A
++    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // Blank key
++    {0x4D, 0x3A, 0x99, 0xC3, 0x51, 0xDD},
++    {0x1A, 0x98, 0x2C, 0x7E, 0x45, 0x9A},
++    {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
++    {0x71, 0x4C, 0x5C, 0x88, 0x6E, 0x97},
++    {0x58, 0x7E, 0xE5, 0xF9, 0x35, 0x0F},
++    {0xA0, 0x47, 0x8C, 0xC3, 0x90, 0x91},
++    {0x53, 0x3C, 0xB6, 0xC7, 0x23, 0xF6},
++    {0x8F, 0xD0, 0xA4, 0xF2, 0x56, 0xE9},
++    {0xA6, 0x45, 0x98, 0xA7, 0x74, 0x78},
++    {0x26, 0x94, 0x0B, 0x21, 0xFF, 0x5D},
++    {0xFC, 0x00, 0x01, 0x87, 0x78, 0xF7},
++    {0x00, 0x00, 0x0F, 0xFE, 0x24, 0x88},
++    {0x5C, 0x8F, 0xF9, 0x99, 0x0D, 0xA2},
++    {0x75, 0xC2, 0x3C, 0x99, 0xD0, 0xE4},
++    {0xE2, 0x16, 0xD6, 0x34, 0x09, 0x5E},
++    {0x11, 0x22, 0x33, 0x44, 0x55, 0x66},
++    {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC},
++    {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56},
++    {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6},
++};
++
++#define MFC_DICT_COUNT (sizeof(k_mfc_default_keys) / sizeof(k_mfc_default_keys[0]))
++
++static void hf_mf_audit_page_start_task(HfMfAuditPage* page, HfMfWorkerTask task);
++
++static int hf_mf_wait_interruptible(
++    uint16_t cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    volatile bool* cancel_requested) {
++    uint32_t start = furi_get_tick();
++    while((furi_get_tick() - start) < timeout_ms) {
++        if(cancel_requested && *cancel_requested) {
++            return PM3_EOPABORTED;
++        }
++        if(proxmark5_frame_take_by_cmd(cmd, resp)) {
++            return PM3_SUCCESS;
++        }
++        furi_delay_ms(10);
++    }
++    return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
++}
++
++static bool hf_mf_check_sector_key(
++    volatile bool* cancel_requested,
++    uint8_t sector,
++    uint8_t key_type,
++    bool clear_trace,
++    PacketResponseNG* resp,
++    uint8_t out_key[6]) {
++    uint8_t payload[5 + MFC_DICT_COUNT * 6];
++    payload[0] = key_type;
++    payload[1] = (uint8_t)(sector * 4U + 3U);
++    payload[2] = clear_trace ? 1U : 0U;
++    payload[3] = (uint8_t)((MFC_DICT_COUNT >> 8) & 0xFFU);
++    payload[4] = (uint8_t)(MFC_DICT_COUNT & 0xFFU);
++    memcpy(payload + 5, k_mfc_default_keys, sizeof(k_mfc_default_keys));
++
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_MIFARE_CHKKEYS, payload, sizeof(payload));
++    if(hf_mf_wait_interruptible(CMD_HF_MIFARE_CHKKEYS, resp, 2500, cancel_requested) !=
++       PM3_SUCCESS) {
++        return false;
++    }
++    if(resp->status == PM3_SUCCESS && resp->length >= 7 && resp->data.asBytes[6] != 0) {
++        memcpy(out_key, resp->data.asBytes, 6);
++        return true;
++    }
++    return false;
++}
++
++static void hf_mf_audit_page_draw_callback(Canvas* canvas, void* context) {
++    HfMfAuditModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str(canvas, 2, 11, "MFC Key Auditor (1K)");
++    canvas_set_font(canvas, FontSecondary);
++
++    switch(model->state) {
++    case HfMfAuditStateIdle:
++        canvas_draw_str(canvas, 4, 26, "Hardware dictionary check");
++        canvas_draw_str(canvas, 4, 36, "across Sectors 0..15 (A & B)");
++        canvas_draw_str(canvas, 4, 46, "Press Audit to scan card.");
++        break;
++    case HfMfAuditStateRunning: {
++        char line[44];
++        snprintf(
++            line,
++            sizeof(line),
++            "Auditing Sector %u / 15... (%u keys)",
++            model->current_sector,
++            model->total_keys_found);
++        canvas_draw_str(canvas, 4, 23, line);
++
++        // Draw 16-sector visual matrix (16 boxes across X=4..116)
++        for(uint8_t s = 0; s < MFC_NUM_SECTORS; s++) {
++            uint8_t x = (uint8_t)(4 + s * 7);
++            canvas_draw_frame(canvas, x, 27, 6, 12);
++            if(model->sectors[s].found_a) {
++                canvas_draw_box(canvas, x + 1, 28, 4, 4);
++            }
++            if(model->sectors[s].found_b) {
++                canvas_draw_box(canvas, x + 1, 34, 4, 4);
++            }
++        }
++        canvas_draw_str(canvas, 4, 49, "Top=KeyA  Bot=KeyB");
++        break;
++    }
++    case HfMfAuditStateDumping:
++        canvas_draw_str(canvas, 4, 30, "Reading sectors & saving .nfc...");
++        if(model->status_msg[0]) {
++            canvas_draw_str(canvas, 4, 42, model->status_msg);
++        }
++        break;
++    case HfMfAuditStateDone: {
++        // Draw compact 16-sector bar at Y=14..23
++        for(uint8_t s = 0; s < MFC_NUM_SECTORS; s++) {
++            uint8_t x = (uint8_t)(4 + s * 7);
++            canvas_draw_frame(canvas, x, 14, 6, 9);
++            if(model->sectors[s].found_a) {
++                canvas_draw_box(canvas, x + 1, 15, 4, 3);
++            }
++            if(model->sectors[s].found_b) {
++                canvas_draw_box(canvas, x + 1, 19, 4, 3);
++            }
++        }
++
++        uint8_t s = model->scroll_sector < MFC_NUM_SECTORS ? model->scroll_sector : 0;
++        const MfcSectorKeys* sec = &model->sectors[s];
++        char line[44];
++        char ka[16] = "------------";
++        char kb[16] = "------------";
++        if(sec->found_a) {
++            snprintf(
++                ka,
++                sizeof(ka),
++                "%02X%02X%02X%02X%02X%02X",
++                sec->key_a[0],
++                sec->key_a[1],
++                sec->key_a[2],
++                sec->key_a[3],
++                sec->key_a[4],
++                sec->key_a[5]);
++        }
++        if(sec->found_b) {
++            snprintf(
++                kb,
++                sizeof(kb),
++                "%02X%02X%02X%02X%02X%02X",
++                sec->key_b[0],
++                sec->key_b[1],
++                sec->key_b[2],
++                sec->key_b[3],
++                sec->key_b[4],
++                sec->key_b[5]);
++        }
++        snprintf(line, sizeof(line), "S%02u A:%s", s, ka);
++        canvas_draw_str(canvas, 4, 32, line);
++        snprintf(line, sizeof(line), "S%02u B:%s", s, kb);
++        canvas_draw_str(canvas, 4, 41, line);
++        if(model->status_msg[0]) {
++            canvas_draw_str(canvas, 4, 50, model->status_msg);
++        } else {
++            snprintf(
++                line,
++                sizeof(line),
++                "Found %u/32 keys (Up/Dn scroll)",
++                model->total_keys_found);
++            canvas_draw_str(canvas, 4, 50, line);
++        }
++        break;
++    }
++    case HfMfAuditStateNoCard:
++        canvas_draw_str(canvas, 4, 28, "No MIFARE Classic card found");
++        canvas_draw_str(canvas, 4, 40, "Place card on HF coil & Audit");
++        break;
++    case HfMfAuditStateError:
++        canvas_draw_str(canvas, 4, 32, "Audit error / timeout");
++        break;
++    }
++
++    elements_button_left(canvas, "Back");
++    if(model->state != HfMfAuditStateRunning && model->state != HfMfAuditStateDumping) {
++        elements_button_center(canvas, "Audit");
++        if(model->state == HfMfAuditStateDone && model->total_keys_found > 0) {
++            elements_button_right(canvas, "Dump");
++        }
++    }
++}
++
++static bool hf_mf_audit_page_input_callback(InputEvent* event, void* context) {
++    HfMfAuditPage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        hf_mf_audit_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!page->worker_running) {
++            hf_mf_audit_page_start_task(page, HfMfWorkerTaskAudit);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        if(!page->worker_running) {
++            HfMfAuditModel* model = view_get_model(page->view);
++            bool can_dump =
++                (model && model->state == HfMfAuditStateDone && model->total_keys_found > 0);
++            view_commit_model(page->view, false);
++            if(can_dump) {
++                hf_mf_audit_page_start_task(page, HfMfWorkerTaskDump);
++            }
++            return true;
++        }
++    }
++
++    if((event->type == InputTypeShort || event->type == InputTypeRepeat) &&
++       (event->key == InputKeyUp || event->key == InputKeyDown)) {
++        HfMfAuditModel* model = view_get_model(page->view);
++        if(model && model->state == HfMfAuditStateDone) {
++            if(event->key == InputKeyUp) {
++                model->scroll_sector = (model->scroll_sector == 0) ?
++                                           (uint8_t)(MFC_NUM_SECTORS - 1U) :
++                                           (uint8_t)(model->scroll_sector - 1U);
++            } else {
++                model->scroll_sector = (uint8_t)((model->scroll_sector + 1U) % MFC_NUM_SECTORS);
++            }
++        }
++        view_commit_model(page->view, true);
++        return true;
++    }
++
++    return false;
++}
++
++static void hf_mf_audit_cleanup_worker(HfMfAuditPage* page) {
++    if(!page || !page->worker_thread || page->worker_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static void hf_mf_dump_to_nfc(HfMfAuditPage* page) {
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        return;
++    }
++
++    HfMfAuditModel* model = view_get_model(page->view);
++    iso14a_card_select_t card = model->card;
++    MfcSectorKeys sectors[MFC_NUM_SECTORS];
++    memcpy(sectors, model->sectors, sizeof(sectors));
++    view_commit_model(page->view, false);
++
++    uint8_t uidlen = card.uidlen > sizeof(card.uid) ? sizeof(card.uid) : card.uidlen;
++    if(uidlen == 0) uidlen = 4;
++    char uid_compact[24] = {0};
++    char uid_spaced[36] = {0};
++    for(uint8_t i = 0; i < uidlen; i++) {
++        snprintf(&uid_compact[i * 2], sizeof(uid_compact) - (i * 2), "%02X", card.uid[i]);
++        snprintf(
++            &uid_spaced[i * 3],
++            sizeof(uid_spaced) - (i * 3),
++            i + 1 < uidlen ? "%02X " : "%02X",
++            card.uid[i]);
++    }
++
++    char path[64];
++    snprintf(path, sizeof(path), "/ext/nfc/PM5_MFC_%s.nfc", uid_compact);
++
++    Storage* storage = furi_record_open(RECORD_STORAGE);
++    storage_simply_mkdir(storage, "/ext/nfc");
++    File* file = storage_file_alloc(storage);
++    bool ok = false;
++
++    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++        char hdr[256];
++        int hlen = snprintf(
++            hdr,
++            sizeof(hdr),
++            "Filetype: Flipper NFC device\n"
++            "Version: 4\n"
++            "# Generated by Proxmark5 Companion v2.0\n"
++            "Device type: Mifare Classic\n"
++            "UID: %s\n"
++            "ATQA: %02X %02X\n"
++            "SAK: %02X\n"
++            "Mifare Classic type: 1K\n"
++            "Data format version: 2\n",
++            uid_spaced,
++            card.atqa[0],
++            card.atqa[1],
++            card.sak ? card.sak : 0x08);
++        if(hlen > 0) {
++            storage_file_write(file, hdr, (uint16_t)hlen);
++        }
++
++        ok = true;
++        for(uint8_t s = 0; s < MFC_NUM_SECTORS && !page->cancel_requested; s++) {
++            uint8_t sector_data[64];
++            memset(sector_data, 0, sizeof(sector_data));
++            bool read_ok = false;
++
++            if(sectors[s].found_a || sectors[s].found_b) {
++                mf_readsector_t rcmd = {
++                    .sectorno = s,
++                    .keytype = sectors[s].found_a ? 0 : 1,
++                };
++                memcpy(
++                    rcmd.key,
++                    sectors[s].found_a ? sectors[s].key_a : sectors[s].key_b,
++                    6);
++
++                clearCommandBuffer();
++                SendCommandNG(CMD_HF_MIFARE_READSC, (uint8_t*)&rcmd, sizeof(rcmd));
++                if(hf_mf_wait_interruptible(
++                       CMD_HF_MIFARE_READSC, resp, 2000, &page->cancel_requested) ==
++                       PM3_SUCCESS &&
++                   resp->status == PM3_SUCCESS && resp->length >= 64) {
++                    memcpy(sector_data, resp->data.asBytes, 64);
++                    read_ok = true;
++                }
++            }
++
++            if(sectors[s].found_a) {
++                memcpy(&sector_data[48], sectors[s].key_a, 6);
++            }
++            if(sectors[s].found_b) {
++                memcpy(&sector_data[58], sectors[s].key_b, 6);
++            }
++
++            for(uint8_t b = 0; b < 4; b++) {
++                uint8_t blk_idx = (uint8_t)(s * 4U + b);
++                char blk_line[96];
++                int pos = snprintf(blk_line, sizeof(blk_line), "Block %u:", blk_idx);
++                for(uint8_t i = 0; i < 16; i++) {
++                    if(!read_ok && b < 3) {
++                        pos += snprintf(blk_line + pos, sizeof(blk_line) - pos, " ??");
++                    } else if(b == 3 && i < 6 && !sectors[s].found_a) {
++                        pos += snprintf(blk_line + pos, sizeof(blk_line) - pos, " ??");
++                    } else if(b == 3 && i >= 10 && !sectors[s].found_b) {
++                        pos += snprintf(blk_line + pos, sizeof(blk_line) - pos, " ??");
++                    } else {
++                        pos += snprintf(
++                            blk_line + pos,
++                            sizeof(blk_line) - pos,
++                            " %02X",
++                            sector_data[b * 16 + i]);
++                    }
++                }
++                pos += snprintf(blk_line + pos, sizeof(blk_line) - pos, "\n");
++                storage_file_write(file, blk_line, (uint16_t)pos);
++            }
++        }
++
++        storage_file_close(file);
++    }
++
++    storage_file_free(file);
++    furi_record_close(RECORD_STORAGE);
++    free(resp);
++
++    model = view_get_model(page->view);
++    model->state = HfMfAuditStateDone;
++    if(ok) {
++        snprintf(model->status_msg, sizeof(model->status_msg), "Saved PM5_MFC_%s.nfc", uid_compact);
++        FURI_LOG_I("PM5_QA_MFAUDIT", "Saved %s", path);
++    } else {
++        snprintf(model->status_msg, sizeof(model->status_msg), "Dump save failed");
++    }
++    view_commit_model(page->view, true);
++}
++
++static int32_t hf_mf_audit_worker(void* context) {
++    HfMfAuditPage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    if(page->worker_task == HfMfWorkerTaskDump) {
++        hf_mf_dump_to_nfc(page);
++        page->worker_running = false;
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        page->worker_running = false;
++        return 0;
++    }
++
++    // Step 1: Select 14A card first so we don't loop on an empty coil
++    iso14a_raw_cmd_t sel_cmd = {
++        .flags = ISO14A_CONNECT | ISO14A_CLEARTRACE,
++        .timeout = 0,
++        .wait_us = 0,
++        .len = 0,
++        .lenbits = 0,
++    };
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_ISO14443A_READER, (uint8_t*)&sel_cmd, sizeof(sel_cmd));
++    int rc = hf_mf_wait_interruptible(
++        CMD_HF_ISO14443A_READER, resp, 2000, &page->cancel_requested);
++
++    if(rc != PM3_SUCCESS || resp->status != PM3_SUCCESS ||
++       resp->length < sizeof(iso14a_raw_resp_t) + sizeof(iso14a_card_select_t)) {
++        HfMfAuditModel* model = view_get_model(page->view);
++        model->state = (rc == PM3_EOPABORTED) ? HfMfAuditStateIdle : HfMfAuditStateError;
++        view_commit_model(page->view, true);
++        free(resp);
++        page->worker_running = false;
++        return 0;
++    }
++
++    const iso14a_raw_resp_t* hdr = (const iso14a_raw_resp_t*)resp->data.asBytes;
++    if(hdr->sel == 0) {
++        HfMfAuditModel* model = view_get_model(page->view);
++        model->state = HfMfAuditStateNoCard;
++        view_commit_model(page->view, true);
++        FURI_LOG_I("PM5_QA_MFAUDIT", "OK (No card in field)");
++        free(resp);
++        page->worker_running = false;
++        return 0;
++    }
++
++    iso14a_card_select_t card;
++    memcpy(&card, resp->data.asBytes + sizeof(iso14a_raw_resp_t), sizeof(card));
++
++    {
++        HfMfAuditModel* model = view_get_model(page->view);
++        model->card = card;
++        memset(model->sectors, 0, sizeof(model->sectors));
++        model->total_keys_found = 0;
++        model->scroll_sector = 0;
++        model->status_msg[0] = '\0';
++        view_commit_model(page->view, true);
++    }
++
++    // Step 2: Check Key A and Key B across all 16 sectors
++    for(uint8_t s = 0; s < MFC_NUM_SECTORS && !page->cancel_requested; s++) {
++        {
++            HfMfAuditModel* model = view_get_model(page->view);
++            model->current_sector = s;
++            view_commit_model(page->view, true);
++        }
++
++        uint8_t key_a[6] = {0};
++        uint8_t key_b[6] = {0};
++        bool found_a = hf_mf_check_sector_key(
++            &page->cancel_requested, s, 0, (s == 0), resp, key_a);
++        bool found_b = false;
++        if(!page->cancel_requested) {
++            found_b = hf_mf_check_sector_key(
++                &page->cancel_requested, s, 1, false, resp, key_b);
++        }
++
++        HfMfAuditModel* model = view_get_model(page->view);
++        model->sectors[s].found_a = found_a;
++        if(found_a) {
++            memcpy(model->sectors[s].key_a, key_a, 6);
++            model->total_keys_found++;
++        }
++        model->sectors[s].found_b = found_b;
++        if(found_b) {
++            memcpy(model->sectors[s].key_b, key_b, 6);
++            model->total_keys_found++;
++        }
++        view_commit_model(page->view, true);
++    }
++
++    free(resp);
++
++    HfMfAuditModel* model = view_get_model(page->view);
++    model->state = page->cancel_requested ? HfMfAuditStateIdle : HfMfAuditStateDone;
++    FURI_LOG_I("PM5_QA_MFAUDIT", "Audit complete: found %u/32 keys", model->total_keys_found);
++    view_commit_model(page->view, true);
++
++    page->worker_running = false;
++    return 0;
++}
++
++HfMfAuditPage*
++    hf_mf_audit_page_create(HfMfAuditPageBackCallback back_callback, void* back_callback_context) {
++    HfMfAuditPage* page = calloc(1, sizeof(HfMfAuditPage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(HfMfAuditModel));
++    view_set_draw_callback(page->view, hf_mf_audit_page_draw_callback);
++    view_set_input_callback(page->view, hf_mf_audit_page_input_callback);
++
++    HfMfAuditModel* model = view_get_model(page->view);
++    memset(model, 0, sizeof(*model));
++    model->state = HfMfAuditStateIdle;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void hf_mf_audit_page_free(HfMfAuditPage* page) {
++    if(!page) {
++        return;
++    }
++
++    page->cancel_requested = true;
++    if(page->worker_thread) {
++        furi_thread_join(page->worker_thread);
++        furi_thread_free(page->worker_thread);
++        page->worker_thread = NULL;
++        page->worker_running = false;
++    }
++
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++
++    free(page);
++}
++
++View* hf_mf_audit_page_get_view(HfMfAuditPage* page) {
++    return page ? page->view : NULL;
++}
++
++static void hf_mf_audit_page_start_task(HfMfAuditPage* page, HfMfWorkerTask task) {
++    if(!page) {
++        return;
++    }
++
++    hf_mf_audit_cleanup_worker(page);
++    if(page->worker_running) {
++        return;
++    }
++
++    page->worker_task = task;
++    HfMfAuditModel* model = view_get_model(page->view);
++    model->state = (task == HfMfWorkerTaskDump) ? HfMfAuditStateDumping : HfMfAuditStateRunning;
++    model->current_sector = 0;
++    view_commit_model(page->view, true);
++
++    page->cancel_requested = false;
++    page->worker_running = true;
++    page->worker_thread =
++        furi_thread_alloc_ex("HfMfAuditWorker", 3072, hf_mf_audit_worker, page);
++    furi_thread_start(page->worker_thread);
++}
++
++void hf_mf_audit_page_start(HfMfAuditPage* page) {
++    hf_mf_audit_page_start_task(page, HfMfWorkerTaskAudit);
++}
++
++void hf_mf_audit_page_stop(HfMfAuditPage* page) {
++    if(!page) {
++        return;
++    }
++
++    if(page->worker_thread && page->worker_running) {
++        page->cancel_requested = true;
++        furi_thread_join(page->worker_thread);
++        page->worker_running = false;
++    }
++
++    hf_mf_audit_cleanup_worker(page);
++
++    HfMfAuditModel* model = view_get_model(page->view);
++    model->state = HfMfAuditStateIdle;
++    view_commit_model(page->view, false);
++}
+diff --git a/pages/hf_mf_audit_page.h b/pages/hf_mf_audit_page.h
+new file mode 100644
+index 0000000..0f19720
+--- /dev/null
++++ b/pages/hf_mf_audit_page.h
+@@ -0,0 +1,16 @@
++#ifndef HF_MF_AUDIT_PAGE_H
++#define HF_MF_AUDIT_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct HfMfAuditPage HfMfAuditPage;
++typedef void (*HfMfAuditPageBackCallback)(void* context);
++
++HfMfAuditPage*
++    hf_mf_audit_page_create(HfMfAuditPageBackCallback back_callback, void* back_callback_context);
++void hf_mf_audit_page_free(HfMfAuditPage* page);
++View* hf_mf_audit_page_get_view(HfMfAuditPage* page);
++void hf_mf_audit_page_start(HfMfAuditPage* page);
++void hf_mf_audit_page_stop(HfMfAuditPage* page);
++
++#endif // HF_MF_AUDIT_PAGE_H
+diff --git a/pages/hf_sniff_page.c b/pages/hf_sniff_page.c
+new file mode 100644
+index 0000000..4c5a170
+--- /dev/null
++++ b/pages/hf_sniff_page.c
+@@ -0,0 +1,533 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <storage/storage.h>
++#include <stdio.h>
++#include <string.h>
++#include "hf_sniff_page.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++#define MAX_SNIFF_FRAMES 24U
++#define MAX_TRACE_BYTES  1024U
++
++typedef enum {
++    HfSniffStateIdle,
++    HfSniffStateSniffing,
++    HfSniffStateDownloading,
++    HfSniffStateDone,
++    HfSniffStateError,
++} HfSniffState;
++
++typedef struct {
++    HfSniffState state;
++    uint32_t elapsed_ds;
++    uint32_t trace_bytes;
++    uint8_t frame_count;
++    uint8_t scroll_idx;
++    char frames[MAX_SNIFF_FRAMES][38];
++    char status_msg[40];
++} HfSniffModel;
++
++struct HfSniffPage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_running;
++    volatile bool stop_sniff_requested;
++    uint8_t* raw_trace;
++    uint32_t raw_trace_len;
++
++    HfSniffPageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static const char* hf_sniff_annotate_cmd(const uint8_t* d, uint16_t len, bool is_resp) {
++    if(len == 0) return "";
++    if(is_resp) {
++        if(len == 2) return "ATQA";
++        if(len == 1 && d[0] == 0x0A) return "ACK";
++        if(len == 5) return "UID+BCC";
++        return "";
++    }
++    switch(d[0]) {
++    case 0x26:
++        return "REQA";
++    case 0x52:
++        return "WUPA";
++    case 0x93:
++        return (len >= 2 && d[1] == 0x20) ? "ANTICOLL1" : "SELECT1";
++    case 0x95:
++        return (len >= 2 && d[1] == 0x20) ? "ANTICOLL2" : "SELECT2";
++    case 0x30:
++        return "READ";
++    case 0xA0:
++        return "WRITE";
++    case 0xA2:
++        return "UL_WRITE";
++    case 0x60:
++        return "AUTH_A";
++    case 0x61:
++        return "AUTH_B";
++    case 0x50:
++        return "HALT";
++    case 0xE0:
++        return "RATS";
++    case 0x40:
++        return "WUPC1";
++    case 0x43:
++        return "WUPC2";
++    default:
++        return "";
++    }
++}
++
++static void hf_sniff_decode_trace(
++    const uint8_t* buf,
++    uint32_t trace_len,
++    HfSniffModel* model) {
++    model->frame_count = 0;
++    model->scroll_idx = 0;
++
++    uint32_t offset = 0;
++    uint32_t limit = trace_len > MAX_TRACE_BYTES ? MAX_TRACE_BYTES : trace_len;
++
++    while(offset + sizeof(tracelog_hdr_t) <= limit && model->frame_count < MAX_SNIFF_FRAMES) {
++        const tracelog_hdr_t* hdr = (const tracelog_hdr_t*)(buf + offset);
++        uint16_t dlen = hdr->data_len;
++        if(dlen == 0 || dlen > 256) {
++            break;
++        }
++        uint16_t plen = (uint16_t)((dlen - 1U) / 8U + 1U);
++        uint32_t next_offset = offset + sizeof(tracelog_hdr_t) + dlen + plen;
++        if(next_offset > limit) {
++            break;
++        }
++
++        const uint8_t* frame_bytes = hdr->frame;
++        char* line = model->frames[model->frame_count];
++        int pos = snprintf(
++            line,
++            sizeof(model->frames[0]),
++            "%02u %s",
++            model->frame_count,
++            hdr->isResponse ? "T<" : "R>");
++
++        uint16_t show_bytes = dlen > 5 ? 5 : dlen;
++        for(uint16_t i = 0; i < show_bytes && pos + 3 < (int)sizeof(model->frames[0]); i++) {
++            pos += snprintf(
++                line + pos,
++                sizeof(model->frames[0]) - pos,
++                " %02X",
++                frame_bytes[i]);
++        }
++        if(dlen > 5 && pos + 3 < (int)sizeof(model->frames[0])) {
++            pos += snprintf(line + pos, sizeof(model->frames[0]) - pos, "..");
++        }
++
++        const char* note = hf_sniff_annotate_cmd(frame_bytes, dlen, hdr->isResponse);
++        if(note[0] && pos + 4 < (int)sizeof(model->frames[0])) {
++            snprintf(line + pos, sizeof(model->frames[0]) - pos, " %s", note);
++        }
++
++        model->frame_count++;
++        offset = next_offset;
++    }
++}
++
++static bool hf_sniff_save_trace_file(HfSniffPage* page, char* out_msg, size_t out_msg_size) {
++    if(!page || !page->raw_trace) {
++        snprintf(out_msg, out_msg_size, "No trace buffer");
++        return false;
++    }
++
++    uint32_t tick_id = (furi_get_tick() / 100U) & 0xFFFFU;
++    char path[64];
++    snprintf(path, sizeof(path), "/ext/apps_data/pm5/hf14a_%04lX.trace", (unsigned long)tick_id);
++
++    Storage* storage = furi_record_open(RECORD_STORAGE);
++    storage_simply_mkdir(storage, "/ext/apps_data");
++    storage_simply_mkdir(storage, "/ext/apps_data/pm5");
++    File* file = storage_file_alloc(storage);
++    bool ok = false;
++    uint32_t save_len =
++        page->raw_trace_len > MAX_TRACE_BYTES ? MAX_TRACE_BYTES : page->raw_trace_len;
++    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++        if(save_len > 0) {
++            uint16_t written = storage_file_write(file, page->raw_trace, (uint16_t)save_len);
++            ok = (written == (uint16_t)save_len);
++        } else {
++            ok = true;
++        }
++        storage_file_close(file);
++    }
++    storage_file_free(file);
++    furi_record_close(RECORD_STORAGE);
++
++    if(ok) {
++        snprintf(out_msg, out_msg_size, "Saved hf14a_%04lX.trace", (unsigned long)tick_id);
++        FURI_LOG_I("PM5_QA_SNIFF", "Saved %s (%lu bytes)", path, (unsigned long)save_len);
++    } else {
++        snprintf(out_msg, out_msg_size, "SD write failed");
++    }
++    return ok;
++}
++
++static void hf_sniff_page_draw_callback(Canvas* canvas, void* context) {
++    HfSniffModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str(canvas, 2, 11, "14a Air Sniffer");
++    canvas_set_font(canvas, FontSecondary);
++
++    switch(model->state) {
++    case HfSniffStateIdle:
++        canvas_draw_str(canvas, 4, 25, "FPGA passive ISO14443A tap");
++        canvas_draw_str(canvas, 4, 35, "Place PM5 between Reader &");
++        canvas_draw_str(canvas, 4, 45, "Tag, then press Sniff.");
++        break;
++    case HfSniffStateSniffing: {
++        char line[44];
++        snprintf(
++            line,
++            sizeof(line),
++            "Sniffing 13.56MHz... %lu.%lus",
++            (unsigned long)(model->elapsed_ds / 10U),
++            (unsigned long)(model->elapsed_ds % 10U));
++        canvas_draw_str(canvas, 4, 26, line);
++        canvas_draw_str(canvas, 4, 37, "Capturing R> & T< frames");
++        canvas_draw_str(canvas, 4, 47, "Press Stop to decode BigBuf");
++        break;
++    }
++    case HfSniffStateDownloading:
++        canvas_draw_str(canvas, 4, 32, "Stopping & reading BigBuf...");
++        break;
++    case HfSniffStateDone: {
++        char hdr[44];
++        if(model->status_msg[0]) {
++            snprintf(hdr, sizeof(hdr), "%s", model->status_msg);
++        } else {
++            snprintf(
++                hdr,
++                sizeof(hdr),
++                "Trace: %luB (%u frames)",
++                (unsigned long)model->trace_bytes,
++                model->frame_count);
++        }
++        canvas_draw_str(canvas, 2, 20, hdr);
++
++        if(model->frame_count == 0) {
++            canvas_draw_str(canvas, 4, 33, "0 frames captured (quiet air)");
++            canvas_draw_str(canvas, 4, 43, "Tap card to reader while");
++            canvas_draw_str(canvas, 4, 51, "sniffing to capture frames.");
++        } else {
++            for(uint8_t row = 0; row < 3; row++) {
++                uint8_t idx = (uint8_t)(model->scroll_idx + row);
++                if(idx < model->frame_count) {
++                    canvas_draw_str(canvas, 2, (uint8_t)(30 + row * 10), model->frames[idx]);
++                }
++            }
++        }
++        break;
++    }
++    case HfSniffStateError:
++        canvas_draw_str(canvas, 4, 34, "Sniffer communication error");
++        break;
++    }
++
++    elements_button_left(canvas, "Back");
++    if(model->state == HfSniffStateSniffing) {
++        elements_button_center(canvas, "Stop");
++    } else if(model->state != HfSniffStateDownloading) {
++        elements_button_center(canvas, "Sniff");
++        if(model->state == HfSniffStateDone && model->trace_bytes > 0) {
++            elements_button_right(canvas, "Save");
++        }
++    }
++}
++
++static bool hf_sniff_page_input_callback(InputEvent* event, void* context) {
++    HfSniffPage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        hf_sniff_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(page->worker_running) {
++            page->stop_sniff_requested = true;
++            HfSniffModel* model = view_get_model(page->view);
++            model->state = HfSniffStateDownloading;
++            view_commit_model(page->view, true);
++        } else {
++            hf_sniff_page_start(page);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        if(!page->worker_running) {
++            HfSniffModel* model = view_get_model(page->view);
++            if(model && model->state == HfSniffStateDone && model->trace_bytes > 0) {
++                hf_sniff_save_trace_file(page, model->status_msg, sizeof(model->status_msg));
++            }
++            view_commit_model(page->view, true);
++            return true;
++        }
++    }
++
++    if((event->type == InputTypeShort || event->type == InputTypeRepeat) &&
++       (event->key == InputKeyUp || event->key == InputKeyDown)) {
++        HfSniffModel* model = view_get_model(page->view);
++        if(model && model->state == HfSniffStateDone && model->frame_count > 3) {
++            if(event->key == InputKeyUp && model->scroll_idx > 0) {
++                model->scroll_idx--;
++            } else if(
++                event->key == InputKeyDown &&
++                (uint8_t)(model->scroll_idx + 3U) < model->frame_count) {
++                model->scroll_idx++;
++            }
++        }
++        view_commit_model(page->view, true);
++        return true;
++    }
++
++    return false;
++}
++
++static void hf_sniff_cleanup_worker(HfSniffPage* page) {
++    if(!page || !page->worker_thread || page->worker_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t hf_sniff_worker(void* context) {
++    HfSniffPage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        page->worker_running = false;
++        return 0;
++    }
++
++    uint8_t param = 0x00; // Trigger immediately on any reader/tag activity
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_ISO14443A_SNIFF, &param, sizeof(param));
++
++    uint32_t start_tick = furi_get_tick();
++    bool sniff_exited = false;
++
++    while(!page->stop_sniff_requested) {
++        proxmark5_com_keep_fast_poll();
++        if(proxmark5_frame_take_by_cmd(CMD_HF_ISO14443A_SNIFF, resp)) {
++            sniff_exited = true;
++            break;
++        }
++        uint32_t ds = (furi_get_tick() - start_tick) / 100U;
++        HfSniffModel* model = view_get_model(page->view);
++        model->elapsed_ds = ds;
++        view_commit_model(page->view, true);
++        furi_delay_ms(50);
++    }
++
++    if(!sniff_exited) {
++        proxmark5_com_set_break_loop(true);
++        WaitForResponseTimeout(CMD_HF_ISO14443A_SNIFF, resp, 1500);
++        proxmark5_com_set_break_loop(false);
++    }
++
++    // Parse trace length reported by PM5 Dbprintf("trace len = %d")
++    uint32_t trace_len = 0;
++    char log_line[160] = {0};
++    while(proxmark5_frame_pop_log(log_line, sizeof(log_line))) {
++        const char* p = strstr(log_line, "trace len =");
++        if(p) {
++            p += 11;
++            while(*p == ' ') p++;
++            uint32_t val = 0;
++            while(*p >= '0' && *p <= '9') {
++                val = val * 10U + (uint32_t)(*p - '0');
++                p++;
++            }
++            trace_len = val;
++        }
++    }
++
++    // Download captured trace from BigBuf in 256-byte chunks if trace_len > 0
++    if(page->raw_trace) {
++        memset(page->raw_trace, 0, MAX_TRACE_BYTES);
++    }
++
++    uint32_t to_download = trace_len > MAX_TRACE_BYTES ? MAX_TRACE_BYTES : trace_len;
++    for(uint32_t offset = 0; offset < to_download; offset += 256U) {
++        download_req_t req = {
++            .start_index = offset,
++            .bytes = 256U,
++        };
++        clearCommandBuffer();
++        SendCommandNG(CMD_DOWNLOAD_BIGBUF, (uint8_t*)&req, sizeof(req));
++
++        bool got_done = WaitForResponseTimeout(CMD_DOWNLOAD_BIGBUF, resp, 1000);
++        if(got_done && resp->status == PM3_SUCCESS && resp->length >= sizeof(download_done_t)) {
++            const download_done_t* done = (const download_done_t*)resp->data.asBytes;
++            trace_len = done->extra;
++        }
++
++        PacketResponseNG* chunk_resp = malloc(sizeof(PacketResponseNG));
++        if(chunk_resp) {
++            if(proxmark5_frame_take_by_cmd(CMD_DOWNLOADED_BIGBUF, chunk_resp) &&
++               chunk_resp->length > sizeof(download_chunk_t) && page->raw_trace) {
++                uint16_t copy_len = (uint16_t)(chunk_resp->length - sizeof(download_chunk_t));
++                if(offset + copy_len <= MAX_TRACE_BYTES) {
++                    memcpy(
++                        page->raw_trace + offset,
++                        chunk_resp->data.asBytes + sizeof(download_chunk_t),
++                        copy_len);
++                }
++            }
++            free(chunk_resp);
++        }
++
++        if(!got_done || to_download <= offset + 256U) {
++            break;
++        }
++    }
++
++    page->raw_trace_len = trace_len;
++
++    HfSniffModel* model = view_get_model(page->view);
++    model->state = HfSniffStateDone;
++    model->trace_bytes = trace_len;
++    model->status_msg[0] = '\0';
++    if(page->raw_trace && trace_len > 0) {
++        hf_sniff_decode_trace(page->raw_trace, trace_len, model);
++    } else {
++        model->frame_count = 0;
++        model->scroll_idx = 0;
++    }
++    FURI_LOG_I(
++        "PM5_QA_SNIFF",
++        "Sniff stopped: trace_len=%lu frames=%u",
++        (unsigned long)trace_len,
++        model->frame_count);
++    view_commit_model(page->view, true);
++
++    free(resp);
++    page->worker_running = false;
++    return 0;
++}
++
++HfSniffPage*
++    hf_sniff_page_create(HfSniffPageBackCallback back_callback, void* back_callback_context) {
++    HfSniffPage* page = calloc(1, sizeof(HfSniffPage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->raw_trace = malloc(MAX_TRACE_BYTES);
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(HfSniffModel));
++    view_set_draw_callback(page->view, hf_sniff_page_draw_callback);
++    view_set_input_callback(page->view, hf_sniff_page_input_callback);
++
++    HfSniffModel* model = view_get_model(page->view);
++    memset(model, 0, sizeof(*model));
++    model->state = HfSniffStateIdle;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void hf_sniff_page_free(HfSniffPage* page) {
++    if(!page) {
++        return;
++    }
++
++    hf_sniff_page_stop(page);
++
++    if(page->raw_trace) {
++        free(page->raw_trace);
++        page->raw_trace = NULL;
++    }
++
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++
++    free(page);
++}
++
++View* hf_sniff_page_get_view(HfSniffPage* page) {
++    return page ? page->view : NULL;
++}
++
++void hf_sniff_page_start(HfSniffPage* page) {
++    if(!page) {
++        return;
++    }
++
++    hf_sniff_cleanup_worker(page);
++    if(page->worker_running) {
++        return;
++    }
++
++    HfSniffModel* model = view_get_model(page->view);
++    model->state = HfSniffStateSniffing;
++    model->elapsed_ds = 0;
++    model->status_msg[0] = '\0';
++    view_commit_model(page->view, true);
++
++    page->stop_sniff_requested = false;
++    page->worker_running = true;
++    page->worker_thread = furi_thread_alloc_ex("HfSniffWorker", 3072, hf_sniff_worker, page);
++    furi_thread_start(page->worker_thread);
++}
++
++void hf_sniff_page_stop(HfSniffPage* page) {
++    if(!page) {
++        return;
++    }
++
++    if(page->worker_thread && page->worker_running) {
++        page->stop_sniff_requested = true;
++        furi_thread_join(page->worker_thread);
++        page->worker_running = false;
++    }
++
++    hf_sniff_cleanup_worker(page);
++
++    HfSniffModel* model = view_get_model(page->view);
++    if(model->state == HfSniffStateSniffing || model->state == HfSniffStateDownloading) {
++        model->state = HfSniffStateIdle;
++    }
++    view_commit_model(page->view, false);
++}
+diff --git a/pages/hf_sniff_page.h b/pages/hf_sniff_page.h
+new file mode 100644
+index 0000000..940fe7f
+--- /dev/null
++++ b/pages/hf_sniff_page.h
+@@ -0,0 +1,15 @@
++#ifndef HF_SNIFF_PAGE_H
++#define HF_SNIFF_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct HfSniffPage HfSniffPage;
++typedef void (*HfSniffPageBackCallback)(void* context);
++
++HfSniffPage* hf_sniff_page_create(HfSniffPageBackCallback back_callback, void* back_callback_context);
++void hf_sniff_page_free(HfSniffPage* page);
++View* hf_sniff_page_get_view(HfSniffPage* page);
++void hf_sniff_page_start(HfSniffPage* page);
++void hf_sniff_page_stop(HfSniffPage* page);
++
++#endif // HF_SNIFF_PAGE_H
+diff --git a/pages/read_hf14a_page.c b/pages/read_hf14a_page.c
+index 3f1f3fd..b18a347 100644
+--- a/pages/read_hf14a_page.c
++++ b/pages/read_hf14a_page.c
+@@ -1,6 +1,9 @@
+ #include <furi.h>
+ #include <gui/canvas.h>
+ #include <gui/elements.h>
++#include <storage/storage.h>
++#include <stdio.h>
++#include <string.h>
+ #include "read_hf14a_page.h"
+ #include "proxmark5_frame.h"
+ #include "pm3_cmd.h"
+@@ -8,15 +11,25 @@
+ typedef enum {
+     ReadHf14aPageStateIdle,
+     ReadHf14aPageStateRunning,
++    ReadHf14aPageStateWritingMagic,
+     ReadHf14aPageStateSuccess,
+     ReadHf14aPageStateNotFound,
+     ReadHf14aPageStateTimeout,
+     ReadHf14aPageStateError,
+ } ReadHf14aPageState;
+ 
++typedef enum {
++    ReadHf14aWorkerTaskScan = 0,
++    ReadHf14aWorkerTaskWriteMagic = 1,
++} ReadHf14aWorkerTask;
++
+ typedef struct {
+     ReadHf14aPageState state;
+     iso14a_card_select_t card;
++    bool has_cached_card;
++    uint16_t magic_flags;
++    uint8_t nonce_status;
++    char action_msg[40];
+ } ReadHf14aPageModel;
+ 
+ struct ReadHf14aPage {
+@@ -25,11 +38,14 @@ struct ReadHf14aPage {
+     FuriThread* worker_thread;
+     volatile bool worker_thread_running;
+     volatile bool worker_thread_cancel_requested;
++    ReadHf14aWorkerTask worker_task;
+ 
+     ReadHf14aPageBackCallback back_callback;
+     void* back_callback_context;
+ };
+ 
++static void read_hf14a_page_start_task(ReadHf14aPage* page, ReadHf14aWorkerTask task);
++
+ static int read_hf14a_wait_for_response_interruptible(
+     uint16_t cmd,
+     PacketResponseNG* resp,
+@@ -56,16 +72,69 @@ static int read_hf14a_wait_for_response_interruptible(
+     return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
+ }
+ 
+-// A connect-only select is a single bounded exchange (the firmware's own
+-// protocol timing bounds it, not a multi-attempt loop like Hitag2's reader),
+-// so unlike read_hitag2_test() this never needs to send CMD_BREAK_LOOP.
+-static int read_hf14a_test(volatile bool* cancel_requested, iso14a_card_select_t* out_card, bool* out_found) {
++static int read_hf14a_probe_magic_and_prng(
++    volatile bool* cancel_requested,
++    bool is_mfc,
++    uint16_t* out_magic_flags,
++    uint8_t* out_nonce_status) {
++    if(out_magic_flags) *out_magic_flags = MAGIC_FLAG_NONE;
++    if(out_nonce_status) *out_nonce_status = 0;
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        return PM3_EMALLOC;
++    }
++
++    mf_chinese_ident_t ident_cmd = {
++        .is_mfc = is_mfc ? 1 : 0,
++        .keytype = 1,
++        .key = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
++    };
++
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_MIFARE_CIDENT, (uint8_t*)&ident_cmd, sizeof(ident_cmd));
++    if(read_hf14a_wait_for_response_interruptible(
++           CMD_HF_MIFARE_CIDENT, resp, 2200, cancel_requested) == PM3_SUCCESS) {
++        if(resp->status == PM3_SUCCESS && resp->length >= sizeof(uint16_t) && out_magic_flags) {
++            uint16_t flags = (uint16_t)resp->data.asBytes[0] |
++                             ((uint16_t)resp->data.asBytes[1] << 8);
++            *out_magic_flags = flags;
++        }
++    }
++
++    if(is_mfc && !(cancel_requested && *cancel_requested)) {
++        clearCommandBuffer();
++        SendCommandNG(CMD_HF_MIFARE_STATIC_NONCE, NULL, 0);
++        if(read_hf14a_wait_for_response_interruptible(
++               CMD_HF_MIFARE_STATIC_NONCE, resp, 1800, cancel_requested) == PM3_SUCCESS) {
++            if(resp->status == PM3_SUCCESS && resp->length >= 1 && out_nonce_status) {
++                *out_nonce_status = resp->data.asBytes[0];
++            }
++        }
++    }
++
++    free(resp);
++    return PM3_SUCCESS;
++}
++
++static int read_hf14a_test(
++    volatile bool* cancel_requested,
++    iso14a_card_select_t* out_card,
++    bool* out_found,
++    uint16_t* out_magic_flags,
++    uint8_t* out_nonce_status) {
+     if(out_found) {
+         *out_found = false;
+     }
+     if(out_card) {
+         memset(out_card, 0, sizeof(*out_card));
+     }
++    if(out_magic_flags) {
++        *out_magic_flags = MAGIC_FLAG_NONE;
++    }
++    if(out_nonce_status) {
++        *out_nonce_status = 0;
++    }
+ 
+     iso14a_raw_cmd_t cmd = {
+         .flags = ISO14A_CONNECT | ISO14A_CLEARTRACE,
+@@ -101,11 +170,9 @@ static int read_hf14a_test(volatile bool* cancel_requested, iso14a_card_select_t
+         return PM3_ESOFT;
+     }
+ 
+-    // resp->status is always PM3_SUCCESS here regardless of whether a card
+-    // was found - the real found/not-found signal is this header's sel
+-    // byte, and the card struct starts right after it, not at offset 0.
+     const iso14a_raw_resp_t* hdr = (const iso14a_raw_resp_t*)resp->data.asBytes;
+-    if(hdr->sel != 0) {
++    bool found = (hdr->sel != 0);
++    if(found) {
+         if(out_card) {
+             memcpy(out_card, resp->data.asBytes + sizeof(iso14a_raw_resp_t), sizeof(*out_card));
+         }
+@@ -115,9 +182,241 @@ static int read_hf14a_test(volatile bool* cancel_requested, iso14a_card_select_t
+     }
+ 
+     free(resp);
++
++    if(found && out_card) {
++        bool is_mfc =
++            (out_card->sak == 0x08 || out_card->sak == 0x09 || out_card->sak == 0x18 ||
++             out_card->sak == 0x28 || out_card->sak == 0x38 || out_card->sak == 0x88);
++        read_hf14a_probe_magic_and_prng(
++            cancel_requested, is_mfc, out_magic_flags, out_nonce_status);
++    }
++
+     return PM3_SUCCESS;
+ }
+ 
++static int read_hf14a_write_magic_uid(
++    volatile bool* cancel_requested,
++    const iso14a_card_select_t* source_card,
++    char* out_msg,
++    size_t out_msg_size) {
++    if(!source_card || source_card->uidlen == 0) {
++        snprintf(out_msg, out_msg_size, "No source UID cached");
++        return PM3_EINVARG;
++    }
++
++    uint16_t magic_flags = MAGIC_FLAG_NONE;
++    read_hf14a_probe_magic_and_prng(cancel_requested, true, &magic_flags, NULL);
++
++    uint8_t block0[16] = {
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x00,
++        0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69};
++    if(source_card->uidlen == 4) {
++        memcpy(block0, source_card->uid, 4);
++        block0[4] = block0[0] ^ block0[1] ^ block0[2] ^ block0[3];
++        block0[5] = source_card->sak ? source_card->sak : 0x08;
++        block0[6] = source_card->atqa[0] ? source_card->atqa[0] : 0x04;
++        block0[7] = source_card->atqa[1];
++    } else if(source_card->uidlen == 7) {
++        memcpy(block0, source_card->uid, 7);
++        block0[7] = source_card->sak ? source_card->sak : 0x08;
++        block0[8] = source_card->atqa[0] ? source_card->atqa[0] : 0x44;
++        block0[9] = source_card->atqa[1];
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        return PM3_EMALLOC;
++    }
++
++    int rc = PM3_ESOFT;
++    if(magic_flags & (MAGIC_FLAG_GEN_1A | MAGIC_FLAG_GEN_1B)) {
++        uint8_t payload[sizeof(mf_chinese_blk_t) + 16];
++        mf_chinese_blk_t* cblk = (mf_chinese_blk_t*)payload;
++        cblk->params = MAGIC_SINGLE | MAGIC_WUPC;
++        cblk->blockno = 0;
++        memcpy(cblk->data, block0, 16);
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_HF_MIFARE_CSETBL, payload, sizeof(payload));
++        if(read_hf14a_wait_for_response_interruptible(
++               CMD_HF_MIFARE_CSETBL, resp, 2000, cancel_requested) == PM3_SUCCESS &&
++           resp->status == PM3_SUCCESS) {
++            snprintf(out_msg, out_msg_size, "Wrote UID to Gen1a Blk0!");
++            rc = PM3_SUCCESS;
++        } else {
++            snprintf(out_msg, out_msg_size, "Gen1a Blk0 write failed");
++        }
++    } else if(magic_flags & MAGIC_FLAG_GEN_3) {
++        uint8_t payload[sizeof(mf_gen3blk_t) + 16];
++        mf_gen3blk_t* g3 = (mf_gen3blk_t*)payload;
++        g3->blocklen = 16;
++        memcpy(g3->block, block0, 16);
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_HF_MIFARE_GEN3BLK, payload, sizeof(payload));
++        if(read_hf14a_wait_for_response_interruptible(
++               CMD_HF_MIFARE_GEN3BLK, resp, 2000, cancel_requested) == PM3_SUCCESS &&
++           resp->status == PM3_SUCCESS) {
++            snprintf(out_msg, out_msg_size, "Wrote UID to Gen3 Blk0!");
++            rc = PM3_SUCCESS;
++        } else {
++            snprintf(out_msg, out_msg_size, "Gen3 Blk0 write failed");
++        }
++    } else {
++        mf_writeblock_ex_t wcmd = {
++            .wakeup = MF_WAKE_WUPA,
++            .auth_cmd = MIFARE_AUTH_KEYA,
++            .key = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
++            .write_cmd = ISO14443A_CMD_WRITEBLOCK,
++            .block_no = 0,
++        };
++        memcpy(wcmd.block_data, block0, 16);
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t*)&wcmd, sizeof(wcmd));
++        if(read_hf14a_wait_for_response_interruptible(
++               CMD_HF_MIFARE_WRITEBL_EX, resp, 2000, cancel_requested) == PM3_SUCCESS &&
++           resp->status == PM3_SUCCESS) {
++            snprintf(out_msg, out_msg_size, "Wrote UID to Gen2/CUID!");
++            rc = PM3_SUCCESS;
++        } else {
++            wcmd.auth_cmd = MIFARE_AUTH_KEYB;
++            clearCommandBuffer();
++            SendCommandNG(CMD_HF_MIFARE_WRITEBL_EX, (uint8_t*)&wcmd, sizeof(wcmd));
++            if(read_hf14a_wait_for_response_interruptible(
++                   CMD_HF_MIFARE_WRITEBL_EX, resp, 2000, cancel_requested) == PM3_SUCCESS &&
++               resp->status == PM3_SUCCESS) {
++                snprintf(out_msg, out_msg_size, "Wrote UID to Gen2 (KeyB)!");
++                rc = PM3_SUCCESS;
++            } else {
++                snprintf(out_msg, out_msg_size, "No writable Magic card");
++            }
++        }
++    }
++
++    free(resp);
++    return rc;
++}
++
++static bool read_hf14a_save_nfc_file(
++    const iso14a_card_select_t* card,
++    char* out_msg,
++    size_t out_msg_size) {
++    if(!card || card->uidlen == 0) {
++        snprintf(out_msg, out_msg_size, "Scan a card first!");
++        return false;
++    }
++
++    uint8_t uidlen = card->uidlen > sizeof(card->uid) ? sizeof(card->uid) : card->uidlen;
++    char uid_compact[24] = {0};
++    char uid_spaced[36] = {0};
++    for(uint8_t i = 0; i < uidlen; i++) {
++        snprintf(&uid_compact[i * 2], sizeof(uid_compact) - (i * 2), "%02X", card->uid[i]);
++        snprintf(
++            &uid_spaced[i * 3],
++            sizeof(uid_spaced) - (i * 3),
++            i + 1 < uidlen ? "%02X " : "%02X",
++            card->uid[i]);
++    }
++
++    char path[64];
++    snprintf(path, sizeof(path), "/ext/nfc/PM5_%s.nfc", uid_compact);
++
++    char content[256];
++    int len = snprintf(
++        content,
++        sizeof(content),
++        "Filetype: Flipper NFC device\n"
++        "Version: 4\n"
++        "# Generated by Proxmark5 Companion v2.0\n"
++        "Device type: ISO14443-3A\n"
++        "UID: %s\n"
++        "ATQA: %02X %02X\n"
++        "SAK: %02X\n",
++        uid_spaced,
++        card->atqa[0],
++        card->atqa[1],
++        card->sak);
++
++    if(len <= 0 || (size_t)len >= sizeof(content)) {
++        snprintf(out_msg, out_msg_size, "Format error");
++        return false;
++    }
++
++    Storage* storage = furi_record_open(RECORD_STORAGE);
++    storage_simply_mkdir(storage, "/ext/nfc");
++    File* file = storage_file_alloc(storage);
++    bool ok = false;
++    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++        uint16_t written = storage_file_write(file, content, (uint16_t)len);
++        ok = (written == (uint16_t)len);
++        storage_file_close(file);
++    }
++    storage_file_free(file);
++    furi_record_close(RECORD_STORAGE);
++
++    if(ok) {
++        snprintf(out_msg, out_msg_size, "Saved PM5_%s.nfc", uid_compact);
++        FURI_LOG_I("PM5_QA_HF14A", "Saved %s", path);
++    } else {
++        snprintf(out_msg, out_msg_size, "SD write failed");
++    }
++    return ok;
++}
++
++static const char* hf14a_get_card_type(const iso14a_card_select_t* card) {
++    uint16_t atqa = ((uint16_t)card->atqa[1] << 8) | card->atqa[0];
++    switch(card->sak) {
++    case 0x00:
++        return "Ultralight / NTAG";
++    case 0x01:
++        return "TNP3xxx (Toy Tag)";
++    case 0x08:
++        return "MIFARE Classic 1K";
++    case 0x09:
++        return "MIFARE Classic Mini";
++    case 0x10:
++    case 0x11:
++        return "MIFARE Plus (SL2)";
++    case 0x18:
++        return "MIFARE Classic 4K";
++    case 0x20:
++        if(atqa == 0x0344) {
++            return "MIFARE DESFire";
++        }
++        return "ISO14443-4 SmartCard";
++    case 0x28:
++        return "SmartMX / JCOP (1K)";
++    case 0x38:
++        return "SmartMX / JCOP (4K)";
++    case 0x88:
++        return "Infineon MIFARE 1K";
++    default:
++        return "ISO14443-A Tag";
++    }
++}
++
++static const char* hf14a_get_magic_name(uint16_t flags) {
++    if(flags & MAGIC_FLAG_GEN_4GTU) return "Gen4 GTU";
++    if(flags & (MAGIC_FLAG_GDM_AUTH | MAGIC_FLAG_GDM_WUP_20 | MAGIC_FLAG_GDM_WUP_40))
++        return "Gen4 GDM";
++    if(flags & MAGIC_FLAG_GEN_3) return "Gen3 APDU";
++    if(flags & MAGIC_FLAG_GEN_2) return "Gen2 CUID";
++    if(flags & MAGIC_FLAG_GEN_1A) return "Gen1a";
++    if(flags & MAGIC_FLAG_GEN_1B) return "Gen1b";
++    if(flags & MAGIC_FLAG_NTAG21X) return "MagicNTAG";
++    if(flags & (MAGIC_FLAG_SUPER_GEN1 | MAGIC_FLAG_SUPER_GEN2)) return "SuperCard";
++    if(flags & MAGIC_FLAG_GEN_UNFUSED) return "Unfused";
++    return "Std";
++}
++
++static const char* hf14a_get_prng_name(uint8_t nonce_status) {
++    if(nonce_status == NONCE_STATIC) return "Static!";
++    if(nonce_status == NONCE_STATIC_ENC) return "StatEnc!";
++    if(nonce_status == NONCE_NORMAL) return "Normal";
++    return "-";
++}
++
+ static void format_uid_hex(const iso14a_card_select_t* card, char* out, size_t out_size) {
+     uint8_t uidlen = card->uidlen > sizeof(card->uid) ? sizeof(card->uid) : card->uidlen;
+     out[0] = '\0';
+@@ -134,34 +433,64 @@ static void read_hf14a_page_draw_callback(Canvas* canvas, void* context) {
+ 
+     canvas_clear(canvas);
+     canvas_set_font(canvas, FontPrimary);
+-    canvas_draw_str(canvas, 4, 16, "HF 14a Reader");
++    canvas_draw_str(canvas, 4, 11, "HF 14a & Magic Lab");
+     canvas_set_font(canvas, FontSecondary);
+ 
+     switch(model->state) {
+     case ReadHf14aPageStateIdle:
+-        canvas_draw_str(canvas, 4, 34, "Waiting to start...");
++        canvas_draw_str(canvas, 4, 28, "Press Scan to read 14A tag,");
++        canvas_draw_str(canvas, 4, 38, "detect Magic Gen & PRNG.");
++        if(model->action_msg[0]) {
++            canvas_draw_str(canvas, 4, 49, model->action_msg);
++        }
+         break;
+     case ReadHf14aPageStateRunning:
+-        canvas_draw_str(canvas, 4, 34, "Scanning... please wait");
++        canvas_draw_str(canvas, 4, 30, "Scanning 14A + Magic + PRNG...");
++        break;
++    case ReadHf14aPageStateWritingMagic:
++        canvas_draw_str(canvas, 4, 30, "Writing Block 0 to Magic tag...");
+         break;
+     case ReadHf14aPageStateSuccess: {
+         char uid_hex[2 * sizeof(model->card.uid) + 1];
+         format_uid_hex(&model->card, uid_hex, sizeof(uid_hex));
+-        char line[40];
++        char line[44];
++        snprintf(
++            line,
++            sizeof(line),
++            "%s (SAK:%02X)",
++            hf14a_get_card_type(&model->card),
++            model->card.sak);
++        canvas_draw_str(canvas, 4, 21, line);
+         snprintf(line, sizeof(line), "UID: %s", uid_hex);
+         canvas_draw_str(canvas, 4, 30, line);
+         snprintf(
+             line,
+             sizeof(line),
+-            "ATQA: %02X%02X  SAK: %02X",
+-            model->card.atqa[1],
+-            model->card.atqa[0],
+-            model->card.sak);
+-        canvas_draw_str(canvas, 4, 42, line);
++            "Magic: %s  PRNG: %s",
++            hf14a_get_magic_name(model->magic_flags),
++            hf14a_get_prng_name(model->nonce_status));
++        canvas_draw_str(canvas, 4, 39, line);
++        if(model->action_msg[0]) {
++            canvas_draw_str(canvas, 4, 49, model->action_msg);
++        } else {
++            canvas_draw_str(canvas, 4, 49, "[Up] Clone UID  [Right] .nfc");
++        }
+         break;
+     }
+     case ReadHf14aPageStateNotFound:
+-        canvas_draw_str(canvas, 4, 34, "No card detected");
++        canvas_draw_str(canvas, 4, 26, "No 14A card in field");
++        if(model->has_cached_card) {
++            char uid_hex[2 * sizeof(model->card.uid) + 1];
++            format_uid_hex(&model->card, uid_hex, sizeof(uid_hex));
++            char line[44];
++            snprintf(line, sizeof(line), "Cached UID: %s", uid_hex);
++            canvas_draw_str(canvas, 4, 37, line);
++        } else {
++            canvas_draw_str(canvas, 4, 37, "Place card on HF coil & Scan");
++        }
++        if(model->action_msg[0]) {
++            canvas_draw_str(canvas, 4, 48, model->action_msg);
++        }
+         break;
+     case ReadHf14aPageStateTimeout:
+         canvas_draw_str(canvas, 4, 34, "Device not responding");
+@@ -174,6 +503,13 @@ static void read_hf14a_page_draw_callback(Canvas* canvas, void* context) {
+     }
+ 
+     elements_button_left(canvas, "Back");
++    if(model->state != ReadHf14aPageStateRunning &&
++       model->state != ReadHf14aPageStateWritingMagic) {
++        elements_button_center(canvas, "Scan");
++        if(model->has_cached_card) {
++            elements_button_right(canvas, ".nfc");
++        }
++    }
+ }
+ 
+ static bool read_hf14a_page_input_callback(InputEvent* event, void* context) {
+@@ -182,9 +518,6 @@ static bool read_hf14a_page_input_callback(InputEvent* event, void* context) {
+         return false;
+     }
+ 
+-    // The page draws a left "Back" button, so it has to actually do something.
+-    // InputKeyBack is deliberately left unhandled: the ViewDispatcher routes it
+-    // through the view's previous-callback, which already leaves the page.
+     if(event->type == InputTypeShort && event->key == InputKeyLeft) {
+         read_hf14a_page_stop(read_hf14a_page);
+         if(read_hf14a_page->back_callback) {
+@@ -193,6 +526,37 @@ static bool read_hf14a_page_input_callback(InputEvent* event, void* context) {
+         return true;
+     }
+ 
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!read_hf14a_page->worker_thread_running) {
++            read_hf14a_page_start_task(read_hf14a_page, ReadHf14aWorkerTaskScan);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        if(!read_hf14a_page->worker_thread_running) {
++            ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
++            if(model && model->has_cached_card) {
++                read_hf14a_save_nfc_file(
++                    &model->card, model->action_msg, sizeof(model->action_msg));
++            }
++            view_commit_model(read_hf14a_page->view, true);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyUp) {
++        if(!read_hf14a_page->worker_thread_running) {
++            ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
++            bool has_card = model && model->has_cached_card;
++            view_commit_model(read_hf14a_page->view, false);
++            if(has_card) {
++                read_hf14a_page_start_task(read_hf14a_page, ReadHf14aWorkerTaskWriteMagic);
++            }
++            return true;
++        }
++    }
++
+     return false;
+ }
+ 
+@@ -216,25 +580,68 @@ static int32_t read_hf14a_page_worker(void* context) {
+         return 0;
+     }
+ 
++    if(read_hf14a_page->worker_task == ReadHf14aWorkerTaskWriteMagic) {
++        iso14a_card_select_t cached_card;
++        ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
++        cached_card = model->card;
++        view_commit_model(read_hf14a_page->view, false);
++
++        char msg[40] = {0};
++        read_hf14a_write_magic_uid(
++            &read_hf14a_page->worker_thread_cancel_requested, &cached_card, msg, sizeof(msg));
++
++        model = view_get_model(read_hf14a_page->view);
++        model->state = ReadHf14aPageStateSuccess;
++        strncpy(model->action_msg, msg, sizeof(model->action_msg) - 1);
++        model->action_msg[sizeof(model->action_msg) - 1] = '\0';
++        view_commit_model(read_hf14a_page->view, true);
++
++        read_hf14a_page->worker_thread_running = false;
++        return 0;
++    }
++
+     iso14a_card_select_t card;
+     bool found = false;
+-    int result =
+-        read_hf14a_test(&read_hf14a_page->worker_thread_cancel_requested, &card, &found);
++    uint16_t magic_flags = MAGIC_FLAG_NONE;
++    uint8_t nonce_status = 0;
++    int result = read_hf14a_test(
++        &read_hf14a_page->worker_thread_cancel_requested,
++        &card,
++        &found,
++        &magic_flags,
++        &nonce_status);
+ 
+     ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
+     if(result == PM3_SUCCESS) {
+         if(found) {
+             model->state = ReadHf14aPageStateSuccess;
+             model->card = card;
++            model->has_cached_card = true;
++            model->magic_flags = magic_flags;
++            model->nonce_status = nonce_status;
++            model->action_msg[0] = '\0';
++            FURI_LOG_I(
++                "PM5_QA_HF14A",
++                "Card found: SAK=0x%02X ATQA=%02X%02X uidlen=%u magic=0x%04X prng=%u",
++                card.sak,
++                card.atqa[1],
++                card.atqa[0],
++                card.uidlen,
++                magic_flags,
++                nonce_status);
+         } else {
+             model->state = ReadHf14aPageStateNotFound;
++            model->action_msg[0] = '\0';
++            FURI_LOG_I("PM5_QA_HF14A", "OK (No card in field)");
+         }
+     } else if(result == PM3_EOPABORTED) {
+         model->state = ReadHf14aPageStateIdle;
+     } else if(result == PM3_ETIMEOUT) {
+         model->state = ReadHf14aPageStateTimeout;
++        FURI_LOG_W("PM5_QA_HF14A", "TIMEOUT");
+     } else {
+         model->state = ReadHf14aPageStateError;
++        FURI_LOG_W("PM5_QA_HF14A", "ERROR res=%d", result);
+     }
+     view_commit_model(read_hf14a_page->view, true);
+ 
+@@ -259,16 +666,13 @@ ReadHf14aPage*
+     read_hf14a_page->back_callback_context = back_callback_context;
+ 
+     view_set_context(read_hf14a_page->view, read_hf14a_page);
+-    // Locking, not LockFree: the worker thread mutates this model while the GUI
+-    // thread draws from it.
+     view_allocate_model(read_hf14a_page->view, ViewModelTypeLocking, sizeof(ReadHf14aPageModel));
+     view_set_draw_callback(read_hf14a_page->view, read_hf14a_page_draw_callback);
+     view_set_input_callback(read_hf14a_page->view, read_hf14a_page_input_callback);
+ 
+     ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
++    memset(model, 0, sizeof(*model));
+     model->state = ReadHf14aPageStateIdle;
+-    memset(&model->card, 0, sizeof(model->card));
+-    // Required: with a locking model, view_get_model() holds the mutex until commit.
+     view_commit_model(read_hf14a_page->view, false);
+ 
+     return read_hf14a_page;
+@@ -279,8 +683,6 @@ void read_hf14a_page_free(ReadHf14aPage* read_hf14a_page) {
+         return;
+     }
+ 
+-    // Runs on the app thread after the view dispatcher has stopped, so blocking
+-    // here is safe - same contract as read_hitag2_page_free().
+     read_hf14a_page->worker_thread_cancel_requested = true;
+ 
+     if(read_hf14a_page->worker_thread) {
+@@ -301,54 +703,50 @@ void read_hf14a_page_free(ReadHf14aPage* read_hf14a_page) {
+ }
+ 
+ View* read_hf14a_page_get_view(ReadHf14aPage* read_hf14a_page) {
+-    if(!read_hf14a_page) {
+-        return NULL;
+-    }
+-
+-    return read_hf14a_page->view;
++    return read_hf14a_page ? read_hf14a_page->view : NULL;
+ }
+ 
+-void read_hf14a_page_start(ReadHf14aPage* read_hf14a_page) {
+-    if(!read_hf14a_page || !read_hf14a_page->view) {
++static void read_hf14a_page_start_task(ReadHf14aPage* read_hf14a_page, ReadHf14aWorkerTask task) {
++    if(!read_hf14a_page) {
+         return;
+     }
+ 
+     read_hf14a_page_cleanup_worker(read_hf14a_page);
+-
+-    // Check cleanup_worker()'s pointer, not worker_thread_running - that flag
+-    // can flip false between the two checks and leak the old FuriThread.
+-    if(read_hf14a_page->worker_thread) {
++    if(read_hf14a_page->worker_thread_running) {
+         return;
+     }
+ 
++    read_hf14a_page->worker_task = task;
+     ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
+-    model->state = ReadHf14aPageStateRunning;
+-    memset(&model->card, 0, sizeof(model->card));
++    model->state = (task == ReadHf14aWorkerTaskWriteMagic) ? ReadHf14aPageStateWritingMagic :
++                                                             ReadHf14aPageStateRunning;
+     view_commit_model(read_hf14a_page->view, true);
+ 
+     read_hf14a_page->worker_thread_cancel_requested = false;
+-
+-    // Same stack sizing rationale as ReadHitag2Task: PacketResponseNG is
+-    // ~560 bytes and several live on this call path at once.
+-    read_hf14a_page->worker_thread =
+-        furi_thread_alloc_ex("ReadHf14aTask", 8192, read_hf14a_page_worker, read_hf14a_page);
+-    if(!read_hf14a_page->worker_thread) {
+-        model = view_get_model(read_hf14a_page->view);
+-        model->state = ReadHf14aPageStateError;
+-        view_commit_model(read_hf14a_page->view, true);
+-        return;
+-    }
+-
+     read_hf14a_page->worker_thread_running = true;
++    read_hf14a_page->worker_thread =
++        furi_thread_alloc_ex("ReadHf14aWorker", 3072, read_hf14a_page_worker, read_hf14a_page);
+     furi_thread_start(read_hf14a_page->worker_thread);
+ }
+ 
+-// Called from the GUI thread (view previous-callback / left button), so it must
+-// never block - same non-blocking contract as read_hitag2_page_stop().
++void read_hf14a_page_start(ReadHf14aPage* read_hf14a_page) {
++    read_hf14a_page_start_task(read_hf14a_page, ReadHf14aWorkerTaskScan);
++}
++
+ void read_hf14a_page_stop(ReadHf14aPage* read_hf14a_page) {
+-    if(!read_hf14a_page || !read_hf14a_page->worker_thread) {
++    if(!read_hf14a_page) {
+         return;
+     }
+ 
+-    read_hf14a_page->worker_thread_cancel_requested = true;
++    if(read_hf14a_page->worker_thread && read_hf14a_page->worker_thread_running) {
++        read_hf14a_page->worker_thread_cancel_requested = true;
++        furi_thread_join(read_hf14a_page->worker_thread);
++        read_hf14a_page->worker_thread_running = false;
++    }
++
++    read_hf14a_page_cleanup_worker(read_hf14a_page);
++
++    ReadHf14aPageModel* model = view_get_model(read_hf14a_page->view);
++    model->state = ReadHf14aPageStateIdle;
++    view_commit_model(read_hf14a_page->view, false);
+ }
+diff --git a/pages/read_hf_multi_page.c b/pages/read_hf_multi_page.c
+new file mode 100644
+index 0000000..130e6c3
+--- /dev/null
++++ b/pages/read_hf_multi_page.c
+@@ -0,0 +1,492 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <string.h>
++#include "read_hf_multi_page.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++typedef enum {
++    HfMultiModeIso15693 = 0,
++    HfMultiModeIclass = 1,
++    HfMultiModeCount = 2,
++} HfMultiMode;
++
++typedef enum {
++    HfMultiStateIdle,
++    HfMultiStateRunning,
++    HfMultiStateSuccess,
++    HfMultiStateNotFound,
++    HfMultiStateTimeout,
++    HfMultiStateError,
++} HfMultiState;
++
++typedef struct {
++    HfMultiMode mode;
++    HfMultiState state;
++    uint8_t uid[8];
++    uint8_t dsfid;
++    uint8_t epurse[8];
++    bool has_epurse;
++} HfMultiModel;
++
++struct ReadHfMultiPage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_thread_running;
++    volatile bool worker_thread_cancel_requested;
++    ReadHfMultiPageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static uint16_t iso15693_crc16(const uint8_t* data, size_t len) {
++    uint32_t crc = 0xFFFF;
++    for(size_t i = 0; i < len; i++) {
++        crc ^= data[i];
++        for(int bit = 0; bit < 8; bit++) {
++            if(crc & 1) {
++                crc = (crc >> 1) ^ 0x8408;
++            } else {
++                crc >>= 1;
++            }
++        }
++    }
++    return (uint16_t)(~crc & 0xFFFF);
++}
++
++static const char* iso15693_get_mfg_name(uint8_t mfg_code) {
++    switch(mfg_code) {
++    case 0x01:
++        return "Motorola";
++    case 0x02:
++        return "STMicroelectronics";
++    case 0x03:
++        return "Hitachi";
++    case 0x04:
++        return "NXP (ICODE/SLIX)";
++    case 0x05:
++        return "Infineon";
++    case 0x07:
++        return "Texas Instruments";
++    case 0x08:
++        return "Fujitsu";
++    case 0x16:
++        return "EM Microelectronic";
++    case 0x2B:
++        return "Maxim";
++    default:
++        return "ISO15693 / NFC-V";
++    }
++}
++
++static int hf_multi_wait_interruptible(
++    uint16_t cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    volatile bool* cancel_requested) {
++    uint32_t start_time = furi_get_tick();
++    while((furi_get_tick() - start_time) < timeout_ms) {
++        if(cancel_requested && *cancel_requested) {
++            return PM3_EOPABORTED;
++        }
++        if(proxmark5_frame_take_by_cmd(cmd, resp)) {
++            return PM3_SUCCESS;
++        }
++        furi_delay_ms(10);
++    }
++    if(cancel_requested && *cancel_requested) {
++        return PM3_EOPABORTED;
++    }
++    return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
++}
++
++static int hf_multi_scan_iso15693(
++    volatile bool* cancel_requested,
++    uint8_t out_uid[8],
++    uint8_t* out_dsfid,
++    bool* out_found) {
++    *out_found = false;
++
++    struct {
++        uint8_t flags;
++        uint16_t rawlen;
++        uint8_t raw[5];
++    } PACKED req;
++
++    // ISO15_CONNECT (1<<0) | ISO15_HIGH_SPEED (1<<4) | ISO15_READ_RESPONSE (1<<5)
++    req.flags = (1 << 0) | (1 << 4) | (1 << 5);
++    req.rawlen = 5;
++    req.raw[0] = 0x26; // Single subcarrier, high data rate, inventory, 1 slot
++    req.raw[1] = 0x01; // Inventory command
++    req.raw[2] = 0x00; // Mask length 0
++    uint16_t crc = iso15693_crc16(req.raw, 3);
++    req.raw[3] = (uint8_t)(crc & 0xFF);
++    req.raw[4] = (uint8_t)((crc >> 8) & 0xFF);
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        return PM3_EMALLOC;
++    }
++
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_ISO15693_COMMAND, (uint8_t*)&req, sizeof(req));
++
++    int wait_res =
++        hf_multi_wait_interruptible(CMD_HF_ISO15693_COMMAND, resp, 2500, cancel_requested);
++    if(wait_res != PM3_SUCCESS) {
++        free(resp);
++        return wait_res;
++    }
++
++    if(resp->status == PM3_SUCCESS && resp->length >= 12) {
++        uint16_t rx_crc = iso15693_crc16(resp->data.asBytes, 10);
++        uint16_t pkt_crc =
++            (uint16_t)resp->data.asBytes[10] | ((uint16_t)resp->data.asBytes[11] << 8);
++        if(rx_crc == pkt_crc) {
++            *out_dsfid = resp->data.asBytes[1];
++            for(int i = 0; i < 8; i++) {
++                out_uid[i] = resp->data.asBytes[9 - i];
++            }
++            *out_found = true;
++        }
++    }
++
++    free(resp);
++    return PM3_SUCCESS;
++}
++
++static int hf_multi_scan_iclass(
++    volatile bool* cancel_requested,
++    uint8_t out_csn[8],
++    uint8_t out_epurse[8],
++    bool* out_has_epurse,
++    bool* out_found) {
++    *out_found = false;
++    *out_has_epurse = false;
++
++    struct {
++        uint8_t flags;
++        uint8_t page;
++    } PACKED req = {
++        .flags = 0x01 | 0x02, // FLAG_ICLASS_READER_INIT | FLAG_ICLASS_READER_CLEARTRACE
++        .page = 0,
++    };
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        return PM3_EMALLOC;
++    }
++
++    clearCommandBuffer();
++    SendCommandNG(CMD_HF_ICLASS_READER, (uint8_t*)&req, sizeof(req));
++
++    int wait_res =
++        hf_multi_wait_interruptible(CMD_HF_ICLASS_READER, resp, 2500, cancel_requested);
++    if(wait_res != PM3_SUCCESS) {
++        free(resp);
++        return wait_res;
++    }
++
++    if(resp->status == PM3_SUCCESS && resp->length >= 1 + 8 + 8 + 8) {
++        uint8_t status_flags = resp->data.asBytes[0];
++        if(status_flags & 0x01) { // FLAG_ICLASS_CSN
++            memcpy(out_csn, &resp->data.asBytes[1], 8);
++            *out_found = true;
++            if(status_flags & 0x02) { // FLAG_ICLASS_CC
++                memcpy(out_epurse, &resp->data.asBytes[1 + 8 + 8], 8);
++                *out_has_epurse = true;
++            }
++        }
++    }
++
++    free(resp);
++    return PM3_SUCCESS;
++}
++
++static void read_hf_multi_draw_callback(Canvas* canvas, void* context) {
++    HfMultiModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    if(model->mode == HfMultiModeIso15693) {
++        canvas_draw_str(canvas, 4, 12, "HF ISO15693 (NFC-V)");
++    } else {
++        canvas_draw_str(canvas, 4, 12, "HF iCLASS / PicoPass");
++    }
++
++    canvas_set_font(canvas, FontSecondary);
++    char line[44];
++    switch(model->state) {
++    case HfMultiStateIdle:
++        canvas_draw_str(canvas, 4, 30, "Press Scan to read tag");
++        canvas_draw_str(canvas, 4, 42, "Press Right to switch mode");
++        break;
++    case HfMultiStateRunning:
++        canvas_draw_str(canvas, 4, 32, "Scanning 13.56 MHz field...");
++        break;
++    case HfMultiStateSuccess:
++        if(model->mode == HfMultiModeIso15693) {
++            snprintf(line, sizeof(line), "Mfg: %s", iso15693_get_mfg_name(model->uid[1]));
++            canvas_draw_str(canvas, 4, 24, line);
++            snprintf(
++                line,
++                sizeof(line),
++                "UID: %02X%02X%02X%02X%02X%02X%02X%02X",
++                model->uid[0],
++                model->uid[1],
++                model->uid[2],
++                model->uid[3],
++                model->uid[4],
++                model->uid[5],
++                model->uid[6],
++                model->uid[7]);
++            canvas_draw_str(canvas, 4, 35, line);
++            snprintf(
++                line,
++                sizeof(line),
++                "DSFID: 0x%02X  IC Mfg: 0x%02X",
++                model->dsfid,
++                model->uid[1]);
++            canvas_draw_str(canvas, 4, 46, line);
++        } else {
++            canvas_draw_str(canvas, 4, 24, "Card: HID iCLASS / PicoPass");
++            snprintf(
++                line,
++                sizeof(line),
++                "CSN: %02X%02X%02X%02X%02X%02X%02X%02X",
++                model->uid[0],
++                model->uid[1],
++                model->uid[2],
++                model->uid[3],
++                model->uid[4],
++                model->uid[5],
++                model->uid[6],
++                model->uid[7]);
++            canvas_draw_str(canvas, 4, 35, line);
++            if(model->has_epurse) {
++                snprintf(
++                    line,
++                    sizeof(line),
++                    "CC:  %02X%02X%02X%02X%02X%02X%02X%02X",
++                    model->epurse[0],
++                    model->epurse[1],
++                    model->epurse[2],
++                    model->epurse[3],
++                    model->epurse[4],
++                    model->epurse[5],
++                    model->epurse[6],
++                    model->epurse[7]);
++                canvas_draw_str(canvas, 4, 46, line);
++            }
++        }
++        break;
++    case HfMultiStateNotFound:
++        if(model->mode == HfMultiModeIso15693) {
++            canvas_draw_str(canvas, 4, 32, "No ISO15693 tag detected");
++        } else {
++            canvas_draw_str(canvas, 4, 32, "No iCLASS card detected");
++        }
++        canvas_draw_str(canvas, 4, 44, "Place on HF coil & Scan");
++        break;
++    case HfMultiStateTimeout:
++        canvas_draw_str(canvas, 4, 34, "Device not responding");
++        break;
++    case HfMultiStateError:
++        canvas_draw_str(canvas, 4, 34, "Scan failed");
++        break;
++    }
++
++    elements_button_left(canvas, "Back");
++    if(model->state != HfMultiStateRunning) {
++        elements_button_center(canvas, "Scan");
++        elements_button_right(canvas, model->mode == HfMultiModeIso15693 ? "iCLASS" : "15693");
++    }
++}
++
++static bool read_hf_multi_input_callback(InputEvent* event, void* context) {
++    ReadHfMultiPage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        read_hf_multi_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        if(!page->worker_thread_running) {
++            HfMultiModel* model = view_get_model(page->view);
++            model->mode = (model->mode + 1) % HfMultiModeCount;
++            model->state = HfMultiStateIdle;
++            view_commit_model(page->view, true);
++            read_hf_multi_page_start(page);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!page->worker_thread_running) {
++            read_hf_multi_page_start(page);
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static void read_hf_multi_cleanup_worker(ReadHfMultiPage* page) {
++    if(!page || !page->worker_thread || page->worker_thread_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t read_hf_multi_worker(void* context) {
++    ReadHfMultiPage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    HfMultiModel* model = view_get_model(page->view);
++    HfMultiMode mode = model->mode;
++    view_commit_model(page->view, false);
++
++    uint8_t uid[8] = {0};
++    uint8_t dsfid = 0;
++    uint8_t epurse[8] = {0};
++    bool has_epurse = false;
++    bool found = false;
++    int res;
++
++    if(mode == HfMultiModeIso15693) {
++        res = hf_multi_scan_iso15693(
++            &page->worker_thread_cancel_requested, uid, &dsfid, &found);
++    } else {
++        res = hf_multi_scan_iclass(
++            &page->worker_thread_cancel_requested, uid, epurse, &has_epurse, &found);
++    }
++
++    model = view_get_model(page->view);
++    if(res == PM3_SUCCESS) {
++        if(found) {
++            memcpy(model->uid, uid, 8);
++            model->dsfid = dsfid;
++            memcpy(model->epurse, epurse, 8);
++            model->has_epurse = has_epurse;
++            model->state = HfMultiStateSuccess;
++            FURI_LOG_I("PM5_QA_HFMulti", "Mode=%d Tag found", mode);
++        } else {
++            model->state = HfMultiStateNotFound;
++            FURI_LOG_I("PM5_QA_HFMulti", "Mode=%d OK (No tag in field)", mode);
++        }
++    } else if(res == PM3_EOPABORTED) {
++        model->state = HfMultiStateIdle;
++    } else if(res == PM3_ETIMEOUT) {
++        model->state = HfMultiStateTimeout;
++        FURI_LOG_W("PM5_QA_HFMulti", "Mode=%d TIMEOUT", mode);
++    } else {
++        model->state = HfMultiStateError;
++        FURI_LOG_W("PM5_QA_HFMulti", "Mode=%d ERROR res=%d", mode, res);
++    }
++    view_commit_model(page->view, true);
++
++    page->worker_thread_running = false;
++    return 0;
++}
++
++ReadHfMultiPage* read_hf_multi_page_create(
++    ReadHfMultiPageBackCallback back_callback,
++    void* back_callback_context) {
++    ReadHfMultiPage* page = calloc(1, sizeof(ReadHfMultiPage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(HfMultiModel));
++    view_set_draw_callback(page->view, read_hf_multi_draw_callback);
++    view_set_input_callback(page->view, read_hf_multi_input_callback);
++
++    HfMultiModel* model = view_get_model(page->view);
++    model->mode = HfMultiModeIso15693;
++    model->state = HfMultiStateIdle;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void read_hf_multi_page_free(ReadHfMultiPage* page) {
++    if(!page) {
++        return;
++    }
++    page->worker_thread_cancel_requested = true;
++    if(page->worker_thread) {
++        furi_thread_join(page->worker_thread);
++        furi_thread_free(page->worker_thread);
++        page->worker_thread = NULL;
++        page->worker_thread_running = false;
++    }
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++    free(page);
++}
++
++View* read_hf_multi_page_get_view(ReadHfMultiPage* page) {
++    return page ? page->view : NULL;
++}
++
++void read_hf_multi_page_start(ReadHfMultiPage* page) {
++    if(!page || !page->view) {
++        return;
++    }
++    read_hf_multi_cleanup_worker(page);
++    if(page->worker_thread) {
++        return;
++    }
++
++    HfMultiModel* model = view_get_model(page->view);
++    model->state = HfMultiStateRunning;
++    view_commit_model(page->view, true);
++
++    page->worker_thread_cancel_requested = false;
++    page->worker_thread =
++        furi_thread_alloc_ex("ReadHfMultiTask", 4096, read_hf_multi_worker, page);
++    if(!page->worker_thread) {
++        model = view_get_model(page->view);
++        model->state = HfMultiStateError;
++        view_commit_model(page->view, true);
++        return;
++    }
++
++    page->worker_thread_running = true;
++    furi_thread_start(page->worker_thread);
++}
++
++void read_hf_multi_page_stop(ReadHfMultiPage* page) {
++    if(!page || !page->worker_thread) {
++        return;
++    }
++    page->worker_thread_cancel_requested = true;
++}
+diff --git a/pages/read_hf_multi_page.h b/pages/read_hf_multi_page.h
+new file mode 100644
+index 0000000..48001ad
+--- /dev/null
++++ b/pages/read_hf_multi_page.h
+@@ -0,0 +1,16 @@
++#ifndef READ_HF_MULTI_PAGE_H
++#define READ_HF_MULTI_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct ReadHfMultiPage ReadHfMultiPage;
++typedef void (*ReadHfMultiPageBackCallback)(void* context);
++
++ReadHfMultiPage*
++    read_hf_multi_page_create(ReadHfMultiPageBackCallback back_callback, void* back_callback_context);
++void read_hf_multi_page_free(ReadHfMultiPage* page);
++View* read_hf_multi_page_get_view(ReadHfMultiPage* page);
++void read_hf_multi_page_start(ReadHfMultiPage* page);
++void read_hf_multi_page_stop(ReadHfMultiPage* page);
++
++#endif // READ_HF_MULTI_PAGE_H
+-- 
+2.56.0
+

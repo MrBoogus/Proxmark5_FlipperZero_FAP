@@ -1,0 +1,3520 @@
+From 24043763fdd11435ac7ae1437c5c0a68ed49723e Mon Sep 17 00:00:00 2001
+From: MrBoogus <90836807+MrBoogus@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:18:50 +0300
+Subject: [PATCH 4/4] lf: add T5577 master suite, LF cloner lab, Hitag2
+ decoder, RF scope, tuner, and PM5 control
+
+- Add t5577_suite_page & t5577_crypto: full 7-mode T5577 workstation supporting
+  EM4100 cloning with parity calculation, block reading/dumping, authenticated
+  writes with password entry, SD dictionary brute-forcing, Atmel test-mode
+  transient unbricking (r0..r3), and downlink password snooping.
+- Add lf_lab_page: 5-mode high-voltage LF cloner (EM410x read/clone, HID Prox
+  read/clone, Block 0 reset) and Flipper .rfid file saving.
+- In read_hitag2_page: add transponder chip identification for PCF 7936, 7946,
+  7947, 7942/44, 7941, 7952, and 7961.
+- Add rf_scope_page: real-time scrolling RF carrier oscilloscope (HF 13.56M,
+  LF 125k, LF 134.8k) with peak voltage tracking and load drop detection.
+- Add antenna_tune_page: full LF + HF antenna resonance sweep with graphical
+  resonance curve plot and frequency divisor markers.
+- Add pm5_control_page: interactive hardware controller for LF frequency banks,
+  Q-factor toggle, coil LEDs, WS2812 RGB illumination, and power-save modes.
+---
+ pages/antenna_tune_page.c |  402 +++++++++++++++
+ pages/antenna_tune_page.h |   16 +
+ pages/lf_lab_page.c       |  587 +++++++++++++++++++++
+ pages/lf_lab_page.h       |   15 +
+ pages/pm5_control_page.c  |  454 +++++++++++++++++
+ pages/pm5_control_page.h  |   16 +
+ pages/read_hitag2_page.c  |  156 +++---
+ pages/rf_scope_page.c     |  445 ++++++++++++++++
+ pages/rf_scope_page.h     |   15 +
+ pages/t5577_crypto.c      |  134 +++++
+ pages/t5577_crypto.h      |   30 ++
+ pages/t5577_suite_page.c  | 1015 +++++++++++++++++++++++++++++++++++++
+ pages/t5577_suite_page.h  |   22 +
+ 13 files changed, 3228 insertions(+), 79 deletions(-)
+ create mode 100644 pages/antenna_tune_page.c
+ create mode 100644 pages/antenna_tune_page.h
+ create mode 100644 pages/lf_lab_page.c
+ create mode 100644 pages/lf_lab_page.h
+ create mode 100644 pages/pm5_control_page.c
+ create mode 100644 pages/pm5_control_page.h
+ create mode 100644 pages/rf_scope_page.c
+ create mode 100644 pages/rf_scope_page.h
+ create mode 100644 pages/t5577_crypto.c
+ create mode 100644 pages/t5577_crypto.h
+ create mode 100644 pages/t5577_suite_page.c
+ create mode 100644 pages/t5577_suite_page.h
+
+diff --git a/pages/antenna_tune_page.c b/pages/antenna_tune_page.c
+new file mode 100644
+index 0000000..3cec8f4
+--- /dev/null
++++ b/pages/antenna_tune_page.c
+@@ -0,0 +1,402 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <string.h>
++#include "antenna_tune_page.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++typedef struct {
++    uint32_t v_lf134;
++    uint32_t v_lf125;
++    uint32_t v_lfconf;
++    uint32_t v_hf;
++    uint32_t peak_v;
++    uint32_t peak_f;
++    int32_t divisor;
++    uint8_t results[256];
++} PACKED pm5_tune_payload_t;
++
++typedef enum {
++    AntennaTuneStateIdle,
++    AntennaTuneStateRunning,
++    AntennaTuneStateReady,
++    AntennaTuneStateTimeout,
++    AntennaTuneStateError,
++} AntennaTuneState;
++
++typedef struct {
++    AntennaTuneState state;
++    uint8_t tab; // 0 = Summary, 1 = LF Spectrum Graph
++    pm5_tune_payload_t data;
++} AntennaTuneModel;
++
++struct AntennaTunePage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_thread_running;
++    volatile bool worker_thread_cancel_requested;
++    AntennaTunePageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static int antenna_tune_wait_interruptible(
++    uint16_t cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    volatile bool* cancel_requested) {
++    uint32_t start_time = furi_get_tick();
++    while((furi_get_tick() - start_time) < timeout_ms) {
++        if(cancel_requested && *cancel_requested) {
++            return PM3_EOPABORTED;
++        }
++        if(proxmark5_frame_take_by_cmd(cmd, resp)) {
++            return PM3_SUCCESS;
++        }
++        furi_delay_ms(15);
++    }
++    if(cancel_requested && *cancel_requested) {
++        return PM3_EOPABORTED;
++    }
++    return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
++}
++
++static void antenna_tune_draw_summary(Canvas* canvas, const pm5_tune_payload_t* d) {
++    char line[44];
++
++    uint32_t lf125_v = d->v_lf125 / 1000;
++    uint32_t lf125_c = (d->v_lf125 % 1000) / 10;
++    snprintf(
++        line,
++        sizeof(line),
++        "LF 125.0k: %2lu.%02lu V %s",
++        (unsigned long)lf125_v,
++        (unsigned long)lf125_c,
++        d->v_lf125 >= 10000 ? "[OK]" : "[LOW]");
++    canvas_draw_str(canvas, 4, 22, line);
++
++    uint32_t lf134_v = d->v_lf134 / 1000;
++    uint32_t lf134_c = (d->v_lf134 % 1000) / 10;
++    snprintf(
++        line,
++        sizeof(line),
++        "LF 134.8k: %2lu.%02lu V",
++        (unsigned long)lf134_v,
++        (unsigned long)lf134_c);
++    canvas_draw_str(canvas, 4, 31, line);
++
++    uint32_t opt_freq_x10 = (d->peak_f > 0) ? (120000u / (d->peak_f + 1u)) : 0;
++    uint32_t peak_v = d->peak_v / 1000;
++    uint32_t peak_c = (d->peak_v % 1000) / 10;
++    snprintf(
++        line,
++        sizeof(line),
++        "LF Peak:   %2lu.%02lu V @%lu.%luk",
++        (unsigned long)peak_v,
++        (unsigned long)peak_c,
++        (unsigned long)(opt_freq_x10 / 10),
++        (unsigned long)(opt_freq_x10 % 10));
++    canvas_draw_str(canvas, 4, 40, line);
++
++    uint32_t hf_v = d->v_hf / 1000;
++    uint32_t hf_c = (d->v_hf % 1000) / 10;
++    snprintf(
++        line,
++        sizeof(line),
++        "HF 13.56M: %2lu.%02lu V %s",
++        (unsigned long)hf_v,
++        (unsigned long)hf_c,
++        d->v_hf >= 15000 ? "[OK]" : "[LOW]");
++    canvas_draw_str(canvas, 4, 49, line);
++}
++
++static void antenna_tune_draw_graph(Canvas* canvas, const pm5_tune_payload_t* d) {
++    // Plot divisors 39..158 (120 points, ~75 kHz to 300 kHz) across x = 4..123
++    const int x_left = 4;
++    const int width = 120;
++    const int y_top = 14;
++    const int y_bottom = 49;
++    const int height = y_bottom - y_top;
++    const int div_min = 39;
++
++    // Axes
++    canvas_draw_line(canvas, x_left, y_bottom, x_left + width - 1, y_bottom);
++    canvas_draw_line(canvas, x_left, y_top, x_left, y_bottom);
++
++    uint8_t max_val = 1;
++    for(int i = 0; i < width; i++) {
++        int div = div_min + i;
++        if(div < 256 && d->results[div] > max_val) {
++            max_val = d->results[div];
++        }
++    }
++
++    // Dotted reference markers at 134.8 kHz (div 88) and 125.0 kHz (div 95)
++    int x_134 = x_left + (88 - div_min);
++    int x_125 = x_left + (95 - div_min);
++    for(int y = y_top; y <= y_bottom; y += 3) {
++        canvas_draw_dot(canvas, x_134, y);
++        canvas_draw_dot(canvas, x_125, y);
++    }
++
++    int prev_x = x_left;
++    int prev_y = y_bottom;
++    for(int i = 0; i < width; i++) {
++        int div = div_min + i;
++        uint8_t val = (div < 256) ? d->results[div] : 0;
++        int y = y_bottom - ((int)val * height) / (int)max_val;
++        if(y < y_top) y = y_top;
++        if(y > y_bottom) y = y_bottom;
++        int x = x_left + i;
++        if(i > 0) {
++            canvas_draw_line(canvas, prev_x, prev_y, x, y);
++        }
++        prev_x = x;
++        prev_y = y;
++    }
++}
++
++static void antenna_tune_page_draw_callback(Canvas* canvas, void* context) {
++    AntennaTuneModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    if(model->state == AntennaTuneStateReady && model->tab == 1) {
++        canvas_draw_str(canvas, 4, 10, "LF Sweep (134k|125k)");
++        canvas_set_font(canvas, FontSecondary);
++        canvas_draw_str_aligned(canvas, 124, 10, AlignRight, AlignBottom, "2/2");
++    } else {
++        canvas_draw_str(canvas, 4, 10, "Antenna Tuner");
++        if(model->state == AntennaTuneStateReady) {
++            canvas_set_font(canvas, FontSecondary);
++            canvas_draw_str_aligned(canvas, 124, 10, AlignRight, AlignBottom, "1/2");
++        }
++    }
++
++    canvas_set_font(canvas, FontSecondary);
++    switch(model->state) {
++    case AntennaTuneStateIdle:
++        canvas_draw_str(canvas, 4, 30, "Press Tune to sweep LF/HF");
++        break;
++    case AntennaTuneStateRunning:
++        canvas_draw_str(canvas, 4, 28, "Sweeping LF & HF coils...");
++        canvas_draw_str(canvas, 4, 40, "Takes ~5s (keep tags away)");
++        break;
++    case AntennaTuneStateReady:
++        if(model->tab == 0) {
++            antenna_tune_draw_summary(canvas, &model->data);
++        } else {
++            antenna_tune_draw_graph(canvas, &model->data);
++        }
++        break;
++    case AntennaTuneStateTimeout:
++        canvas_draw_str(canvas, 4, 32, "Measurement timed out");
++        break;
++    case AntennaTuneStateError:
++        canvas_draw_str(canvas, 4, 32, "Measurement failed");
++        break;
++    }
++
++    elements_button_left(canvas, "Back");
++    if(model->state != AntennaTuneStateRunning) {
++        elements_button_center(canvas, "Tune");
++    }
++    if(model->state == AntennaTuneStateReady) {
++        elements_button_right(canvas, model->tab == 0 ? "Graph" : "Data");
++    }
++}
++
++static bool antenna_tune_page_input_callback(InputEvent* event, void* context) {
++    AntennaTunePage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        antenna_tune_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        AntennaTuneModel* model = view_get_model(page->view);
++        bool handled = false;
++        if(model->state == AntennaTuneStateReady) {
++            model->tab = (model->tab + 1) % 2;
++            handled = true;
++        }
++        view_commit_model(page->view, handled);
++        return handled;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!page->worker_thread_running) {
++            antenna_tune_page_start(page);
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static void antenna_tune_cleanup_worker(AntennaTunePage* page) {
++    if(!page || !page->worker_thread || page->worker_thread_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t antenna_tune_worker(void* context) {
++    AntennaTunePage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        AntennaTuneModel* model = view_get_model(page->view);
++        model->state = AntennaTuneStateError;
++        view_commit_model(page->view, true);
++        page->worker_thread_running = false;
++        return 0;
++    }
++
++    clearCommandBuffer();
++    SendCommandNG(CMD_MEASURE_ANTENNA_TUNING, NULL, 0);
++
++    // MeasureAntennaTuning sweeps 237 LF divisors * 20ms + 100ms HF (~4.9s total)
++    int wait_res = antenna_tune_wait_interruptible(
++        CMD_MEASURE_ANTENNA_TUNING, resp, 8000, &page->worker_thread_cancel_requested);
++
++    // MeasureAntennaTuning blocks PM5's main loop for ~4.9s (> CEP_ACTIVITY_TIMEOUT_MS = 3s),
++    // which causes PM5's next cep_attach_poll() to drop s_cep_active to false.
++    // Re-handshake immediately so subsequent commands work without delay.
++    if(!page->worker_thread_cancel_requested) {
++        proxmark5_com_handshake();
++    }
++
++    AntennaTuneModel* model = view_get_model(page->view);
++    if(wait_res == PM3_SUCCESS && resp->status == PM3_SUCCESS &&
++       resp->length >= sizeof(pm5_tune_payload_t)) {
++        memcpy(&model->data, resp->data.asBytes, sizeof(pm5_tune_payload_t));
++        model->state = AntennaTuneStateReady;
++        FURI_LOG_I(
++            "PM5_QA_Tune",
++            "OK: LF125=%lumV LF134=%lumV HF=%lumV Peak=%lumV@div%u",
++            (unsigned long)model->data.v_lf125,
++            (unsigned long)model->data.v_lf134,
++            (unsigned long)model->data.v_hf,
++            (unsigned long)model->data.peak_v,
++            (unsigned)model->data.peak_f);
++    } else if(wait_res == PM3_EOPABORTED) {
++        model->state = AntennaTuneStateIdle;
++    } else if(wait_res == PM3_ETIMEOUT) {
++        model->state = AntennaTuneStateTimeout;
++        FURI_LOG_W("PM5_QA_Tune", "TIMEOUT");
++    } else {
++        model->state = AntennaTuneStateError;
++        FURI_LOG_W("PM5_QA_Tune", "ERROR res=%d", wait_res);
++    }
++    view_commit_model(page->view, true);
++
++    free(resp);
++    page->worker_thread_running = false;
++    return 0;
++}
++
++AntennaTunePage* antenna_tune_page_create(
++    AntennaTunePageBackCallback back_callback,
++    void* back_callback_context) {
++    AntennaTunePage* page = calloc(1, sizeof(AntennaTunePage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(AntennaTuneModel));
++    view_set_draw_callback(page->view, antenna_tune_page_draw_callback);
++    view_set_input_callback(page->view, antenna_tune_page_input_callback);
++
++    AntennaTuneModel* model = view_get_model(page->view);
++    model->state = AntennaTuneStateIdle;
++    model->tab = 0;
++    memset(&model->data, 0, sizeof(model->data));
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void antenna_tune_page_free(AntennaTunePage* page) {
++    if(!page) {
++        return;
++    }
++    page->worker_thread_cancel_requested = true;
++    if(page->worker_thread) {
++        furi_thread_join(page->worker_thread);
++        furi_thread_free(page->worker_thread);
++        page->worker_thread = NULL;
++        page->worker_thread_running = false;
++    }
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++    free(page);
++}
++
++View* antenna_tune_page_get_view(AntennaTunePage* page) {
++    return page ? page->view : NULL;
++}
++
++void antenna_tune_page_start(AntennaTunePage* page) {
++    if(!page || !page->view) {
++        return;
++    }
++    antenna_tune_cleanup_worker(page);
++    if(page->worker_thread) {
++        return;
++    }
++
++    AntennaTuneModel* model = view_get_model(page->view);
++    model->state = AntennaTuneStateRunning;
++    view_commit_model(page->view, true);
++
++    page->worker_thread_cancel_requested = false;
++    page->worker_thread =
++        furi_thread_alloc_ex("AntennaTuneTask", 4096, antenna_tune_worker, page);
++    if(!page->worker_thread) {
++        model = view_get_model(page->view);
++        model->state = AntennaTuneStateError;
++        view_commit_model(page->view, true);
++        return;
++    }
++
++    page->worker_thread_running = true;
++    furi_thread_start(page->worker_thread);
++}
++
++void antenna_tune_page_stop(AntennaTunePage* page) {
++    if(!page || !page->worker_thread) {
++        return;
++    }
++    page->worker_thread_cancel_requested = true;
++}
+diff --git a/pages/antenna_tune_page.h b/pages/antenna_tune_page.h
+new file mode 100644
+index 0000000..6d9a18b
+--- /dev/null
++++ b/pages/antenna_tune_page.h
+@@ -0,0 +1,16 @@
++#ifndef ANTENNA_TUNE_PAGE_H
++#define ANTENNA_TUNE_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct AntennaTunePage AntennaTunePage;
++typedef void (*AntennaTunePageBackCallback)(void* context);
++
++AntennaTunePage*
++    antenna_tune_page_create(AntennaTunePageBackCallback back_callback, void* back_callback_context);
++void antenna_tune_page_free(AntennaTunePage* page);
++View* antenna_tune_page_get_view(AntennaTunePage* page);
++void antenna_tune_page_start(AntennaTunePage* page);
++void antenna_tune_page_stop(AntennaTunePage* page);
++
++#endif // ANTENNA_TUNE_PAGE_H
+diff --git a/pages/lf_lab_page.c b/pages/lf_lab_page.c
+new file mode 100644
+index 0000000..db81d34
+--- /dev/null
++++ b/pages/lf_lab_page.c
+@@ -0,0 +1,587 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <storage/storage.h>
++#include <stdio.h>
++#include <string.h>
++#include "lf_lab_page.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++typedef enum {
++    LfLabModeReadEm410x = 0,
++    LfLabModeReadHidProx = 1,
++    LfLabModeCloneEmToT5577 = 2,
++    LfLabModeCloneHidToT5577 = 3,
++    LfLabModeResetT5577Blk0 = 4,
++    LfLabModeCount = 5,
++} LfLabMode;
++
++typedef enum {
++    LfLabStateIdle,
++    LfLabStateRunning,
++    LfLabStateSuccess,
++    LfLabStateNotFound,
++    LfLabStateError,
++} LfLabState;
++
++typedef struct {
++    LfLabState state;
++    LfLabMode mode;
++    bool has_em_id;
++    uint8_t em_id[5];
++    bool has_hid_id;
++    uint32_t hid_hi;
++    uint32_t hid_lo;
++    char detail_line[44];
++    char status_msg[44];
++} LfLabModel;
++
++struct LfLabPage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_running;
++    volatile bool cancel_requested;
++
++    LfLabPageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static const char* const k_lf_mode_names[LfLabModeCount] = {
++    "1. Read EM410x (125k)",
++    "2. Read HID Prox (FSK)",
++    "3. Clone EM -> T5577",
++    "4. Clone HID -> T5577",
++    "5. Init T5577 Block 0",
++};
++
++static int lf_lab_wait_interruptible(
++    uint16_t cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    volatile bool* cancel_requested) {
++    uint32_t start = furi_get_tick();
++    while((furi_get_tick() - start) < timeout_ms) {
++        proxmark5_com_keep_fast_poll();
++        if(cancel_requested && *cancel_requested) {
++            return PM3_EOPABORTED;
++        }
++        if(proxmark5_frame_take_by_cmd(cmd, resp)) {
++            return PM3_SUCCESS;
++        }
++        furi_delay_ms(10);
++    }
++    return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
++}
++
++static uint8_t hex_nibble(char c) {
++    if(c >= '0' && c <= '9') return (uint8_t)(c - '0');
++    if(c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
++    if(c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
++    return 0xFF;
++}
++
++static bool parse_em410x_log(const char* log_str, uint8_t out_id[5]) {
++    const char* p = strstr(log_str, "EM TAG ID:");
++    if(!p) return false;
++    p += strlen("EM TAG ID:");
++    while(*p == ' ') p++;
++
++    for(int i = 0; i < 5; i++) {
++        uint8_t hi = hex_nibble(p[i * 2]);
++        uint8_t lo = hex_nibble(p[i * 2 + 1]);
++        if(hi == 0xFF || lo == 0xFF) return false;
++        out_id[i] = (uint8_t)((hi << 4) | lo);
++    }
++    return true;
++}
++
++static bool parse_hid_log(const char* log_str, uint32_t* out_hi, uint32_t* out_lo) {
++    const char* p = strstr(log_str, "TAG ID:");
++    if(!p) return false;
++    p += strlen("TAG ID:");
++    while(*p == ' ') p++;
++
++    uint64_t val = 0;
++    int digits = 0;
++    while(hex_nibble(*p) != 0xFF && digits < 16) {
++        val = (val << 4) | hex_nibble(*p);
++        p++;
++        digits++;
++    }
++    if(digits < 8) return false;
++    *out_hi = (uint32_t)(val >> 32);
++    *out_lo = (uint32_t)(val & 0xFFFFFFFFULL);
++    return true;
++}
++
++static bool lf_lab_save_rfid_file(const uint8_t em_id[5], char* out_msg, size_t out_msg_size) {
++    char id_hex[16];
++    snprintf(
++        id_hex,
++        sizeof(id_hex),
++        "%02X%02X%02X%02X%02X",
++        em_id[0],
++        em_id[1],
++        em_id[2],
++        em_id[3],
++        em_id[4]);
++
++    char path[64];
++    snprintf(path, sizeof(path), "/ext/lfrfid/PM5_EM_%s.rfid", id_hex);
++
++    char content[160];
++    int len = snprintf(
++        content,
++        sizeof(content),
++        "Filetype: Flipper RFID key\n"
++        "Version: 1\n"
++        "Key type: EM4100\n"
++        "Data: %02X %02X %02X %02X %02X\n",
++        em_id[0],
++        em_id[1],
++        em_id[2],
++        em_id[3],
++        em_id[4]);
++
++    if(len <= 0 || (size_t)len >= sizeof(content)) {
++        snprintf(out_msg, out_msg_size, "Format error");
++        return false;
++    }
++
++    Storage* storage = furi_record_open(RECORD_STORAGE);
++    storage_simply_mkdir(storage, "/ext/lfrfid");
++    File* file = storage_file_alloc(storage);
++    bool ok = false;
++    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++        uint16_t written = storage_file_write(file, content, (uint16_t)len);
++        ok = (written == (uint16_t)len);
++        storage_file_close(file);
++    }
++    storage_file_free(file);
++    furi_record_close(RECORD_STORAGE);
++
++    if(ok) {
++        snprintf(out_msg, out_msg_size, "Saved PM5_EM_%s.rfid", id_hex);
++        FURI_LOG_I("PM5_QA_LFLAB", "Saved %s", path);
++    } else {
++        snprintf(out_msg, out_msg_size, "SD write failed");
++    }
++    return ok;
++}
++
++static void lf_lab_page_draw_callback(Canvas* canvas, void* context) {
++    LfLabModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str(canvas, 2, 11, "LF Multi-Cloner Lab");
++    canvas_set_font(canvas, FontSecondary);
++
++    char line[48];
++    snprintf(line, sizeof(line), "> %s", k_lf_mode_names[model->mode]);
++    canvas_draw_str(canvas, 2, 22, line);
++
++    if(model->state == LfLabStateRunning) {
++        canvas_draw_str(canvas, 4, 34, "Running LF operation...");
++        canvas_draw_str(canvas, 4, 44, "Place LF tag on PM5 coil");
++    } else {
++        if(model->has_em_id) {
++            snprintf(
++                line,
++                sizeof(line),
++                "EM410x: %02X%02X%02X%02X%02X",
++                model->em_id[0],
++                model->em_id[1],
++                model->em_id[2],
++                model->em_id[3],
++                model->em_id[4]);
++            canvas_draw_str(canvas, 4, 32, line);
++        } else {
++            canvas_draw_str(canvas, 4, 32, "EM410x: (none cached)");
++        }
++
++        if(model->has_hid_id) {
++            snprintf(
++                line,
++                sizeof(line),
++                "HID: %02lX%08lX",
++                (unsigned long)model->hid_hi,
++                (unsigned long)model->hid_lo);
++            canvas_draw_str(canvas, 4, 41, line);
++        } else if(model->detail_line[0]) {
++            canvas_draw_str(canvas, 4, 41, model->detail_line);
++        } else {
++            canvas_draw_str(canvas, 4, 41, "Up/Dn: Mode   OK: Run");
++        }
++
++        if(model->status_msg[0]) {
++            canvas_draw_str(canvas, 4, 50, model->status_msg);
++        }
++    }
++
++    elements_button_left(canvas, "Back");
++    if(model->state != LfLabStateRunning) {
++        elements_button_center(canvas, "Run");
++        if(model->has_em_id) {
++            elements_button_right(canvas, ".rfid");
++        }
++    }
++}
++
++static bool lf_lab_page_input_callback(InputEvent* event, void* context) {
++    LfLabPage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        lf_lab_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if((event->type == InputTypeShort || event->type == InputTypeRepeat) &&
++       (event->key == InputKeyUp || event->key == InputKeyDown)) {
++        if(!page->worker_running) {
++            LfLabModel* model = view_get_model(page->view);
++            if(event->key == InputKeyUp) {
++                model->mode =
++                    (model->mode == 0) ? (LfLabMode)(LfLabModeCount - 1) : (LfLabMode)(model->mode - 1);
++            } else {
++                model->mode = (LfLabMode)((model->mode + 1) % LfLabModeCount);
++            }
++            view_commit_model(page->view, true);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!page->worker_running) {
++            lf_lab_page_start(page);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        if(!page->worker_running) {
++            LfLabModel* model = view_get_model(page->view);
++            if(model && model->has_em_id) {
++                lf_lab_save_rfid_file(
++                    model->em_id, model->status_msg, sizeof(model->status_msg));
++            }
++            view_commit_model(page->view, true);
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static void lf_lab_cleanup_worker(LfLabPage* page) {
++    if(!page || !page->worker_thread || page->worker_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t lf_lab_worker(void* context) {
++    LfLabPage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        page->worker_running = false;
++        return 0;
++    }
++
++    LfLabModel* model = view_get_model(page->view);
++    LfLabMode mode = model->mode;
++    uint8_t em_id[5];
++    memcpy(em_id, model->em_id, 5);
++    bool has_em = model->has_em_id;
++    uint32_t hid_hi = model->hid_hi;
++    uint32_t hid_lo = model->hid_lo;
++    bool has_hid = model->has_hid_id;
++    view_commit_model(page->view, false);
++
++    if(mode == LfLabModeReadEm410x || mode == LfLabModeReadHidProx) {
++        uint16_t watch_cmd =
++            (mode == LfLabModeReadEm410x) ? CMD_LF_EM410X_WATCH : CMD_LF_HID_WATCH;
++        clearCommandBuffer();
++        SendCommandNG(watch_cmd, NULL, 0);
++
++        bool found = false;
++        char log_line[160] = {0};
++        uint32_t start = furi_get_tick();
++        bool break_armed = false;
++        while((furi_get_tick() - start) < 4200 && !page->cancel_requested) {
++            proxmark5_com_keep_fast_poll();
++            if(!break_armed && (furi_get_tick() - start) >= 250) {
++                // Once pass 1 of DoAcquisition_default has started on PM5, arm
++                // 0x55 break-poll so lf_em410x_watch/lf_hid_watch exits cleanly
++                // immediately after completing pass 1.
++                proxmark5_com_set_break_loop(true);
++                break_armed = true;
++            }
++            if(proxmark5_frame_pop_log(log_line, sizeof(log_line))) {
++                if(mode == LfLabModeReadEm410x && parse_em410x_log(log_line, em_id)) {
++                    found = true;
++                    has_em = true;
++                } else if(
++                    mode == LfLabModeReadHidProx && parse_hid_log(log_line, &hid_hi, &hid_lo)) {
++                    found = true;
++                    has_hid = true;
++                }
++            }
++            if(proxmark5_frame_take_by_cmd(watch_cmd, resp)) {
++                break;
++            }
++            furi_delay_ms(20);
++        }
++        proxmark5_com_set_break_loop(false);
++
++        model = view_get_model(page->view);
++        if(found) {
++            model->state = LfLabStateSuccess;
++            if(mode == LfLabModeReadEm410x) {
++                memcpy(model->em_id, em_id, 5);
++                model->has_em_id = true;
++                snprintf(model->status_msg, sizeof(model->status_msg), "EM410x tag captured!");
++                FURI_LOG_I(
++                    "PM5_QA_LFLAB",
++                    "EM410x found: %02X%02X%02X%02X%02X",
++                    em_id[0],
++                    em_id[1],
++                    em_id[2],
++                    em_id[3],
++                    em_id[4]);
++            } else {
++                model->hid_hi = hid_hi;
++                model->hid_lo = hid_lo;
++                model->has_hid_id = true;
++                snprintf(model->status_msg, sizeof(model->status_msg), "HID Prox tag captured!");
++                FURI_LOG_I(
++                    "PM5_QA_LFLAB",
++                    "HID found: %02lX%08lX",
++                    (unsigned long)hid_hi,
++                    (unsigned long)hid_lo);
++            }
++        } else {
++            model->state = LfLabStateNotFound;
++            snprintf(
++                model->status_msg,
++                sizeof(model->status_msg),
++                mode == LfLabModeReadEm410x ? "No EM410x tag in field" : "No HID tag in field");
++            FURI_LOG_I("PM5_QA_LFLAB", "OK (%s)", model->status_msg);
++        }
++        view_commit_model(page->view, true);
++    } else if(mode == LfLabModeCloneEmToT5577) {
++        if(!has_em) {
++            // Provide a valid test ID if none scanned yet so user can test T5577 writer
++            const uint8_t default_em[5] = {0x0F, 0x03, 0x68, 0x56, 0x8B};
++            memcpy(em_id, default_em, 5);
++            has_em = true;
++        }
++        struct {
++            bool Q5;
++            bool EM;
++            bool add_electra;
++            uint8_t clock;
++            uint32_t high;
++            uint32_t low;
++        } PACKED payload = {
++            .Q5 = false,
++            .EM = false,
++            .add_electra = false,
++            .clock = 64,
++            .high = (uint32_t)em_id[0],
++            .low = ((uint32_t)em_id[1] << 24) | ((uint32_t)em_id[2] << 16) |
++                   ((uint32_t)em_id[3] << 8) | (uint32_t)em_id[4],
++        };
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_EM410X_CLONE, (uint8_t*)&payload, sizeof(payload));
++        int rc = lf_lab_wait_interruptible(
++            CMD_LF_EM410X_CLONE, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        memcpy(model->em_id, em_id, 5);
++        model->has_em_id = true;
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            model->state = LfLabStateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Cloned EM410x to T5577!");
++            FURI_LOG_I("PM5_QA_LFLAB", "Cloned EM410x to T5577 OK");
++        } else {
++            model->state = LfLabStateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "T5577 EM clone failed");
++            FURI_LOG_W("PM5_QA_LFLAB", "Clone EM failed rc=%d status=%d", rc, resp->status);
++        }
++        view_commit_model(page->view, true);
++    } else if(mode == LfLabModeCloneHidToT5577) {
++        if(!has_hid) {
++            hid_hi = 0x20;
++            hid_lo = 0x04263F8C;
++            has_hid = true;
++        }
++        lf_hidsim_t payload = {
++            .hi2 = 0,
++            .hi = hid_hi,
++            .lo = hid_lo,
++            .longFMT = 0,
++            .Q5 = false,
++            .EM = false,
++        };
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_HID_CLONE, (uint8_t*)&payload, sizeof(payload));
++        int rc =
++            lf_lab_wait_interruptible(CMD_LF_HID_CLONE, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        model->hid_hi = hid_hi;
++        model->hid_lo = hid_lo;
++        model->has_hid_id = true;
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            model->state = LfLabStateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Cloned HID to T5577!");
++            FURI_LOG_I("PM5_QA_LFLAB", "Cloned HID to T5577 OK");
++        } else {
++            model->state = LfLabStateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "T5577 HID clone failed");
++            FURI_LOG_W("PM5_QA_LFLAB", "Clone HID failed rc=%d status=%d", rc, resp->status);
++        }
++        view_commit_model(page->view, true);
++    } else if(mode == LfLabModeResetT5577Blk0) {
++        t55xx_write_block_t wbl = {
++            .data = 0x00148040U, // RF/64, Manchester, MaxBlock=2
++            .pwd = 0,
++            .blockno = 0,
++            .flags = 0x20,
++        };
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_T55XX_WRITEBL, (uint8_t*)&wbl, sizeof(wbl));
++        int rc = lf_lab_wait_interruptible(
++            CMD_LF_T55XX_WRITEBL, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            model->state = LfLabStateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "T5577 Blk0 = 0x00148040!");
++            FURI_LOG_I("PM5_QA_LFLAB", "T5577 Block 0 init OK");
++        } else {
++            model->state = LfLabStateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "T5577 Blk0 write failed");
++            FURI_LOG_W("PM5_QA_LFLAB", "T5577 Blk0 failed rc=%d status=%d", rc, resp->status);
++        }
++        view_commit_model(page->view, true);
++    }
++
++    free(resp);
++    page->worker_running = false;
++    return 0;
++}
++
++LfLabPage* lf_lab_page_create(LfLabPageBackCallback back_callback, void* back_callback_context) {
++    LfLabPage* page = calloc(1, sizeof(LfLabPage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(LfLabModel));
++    view_set_draw_callback(page->view, lf_lab_page_draw_callback);
++    view_set_input_callback(page->view, lf_lab_page_input_callback);
++
++    LfLabModel* model = view_get_model(page->view);
++    memset(model, 0, sizeof(*model));
++    model->state = LfLabStateIdle;
++    model->mode = LfLabModeReadEm410x;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void lf_lab_page_free(LfLabPage* page) {
++    if(!page) {
++        return;
++    }
++
++    page->cancel_requested = true;
++    if(page->worker_thread) {
++        furi_thread_join(page->worker_thread);
++        furi_thread_free(page->worker_thread);
++        page->worker_thread = NULL;
++        page->worker_running = false;
++    }
++
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++
++    free(page);
++}
++
++View* lf_lab_page_get_view(LfLabPage* page) {
++    return page ? page->view : NULL;
++}
++
++void lf_lab_page_start(LfLabPage* page) {
++    if(!page) {
++        return;
++    }
++
++    lf_lab_cleanup_worker(page);
++    if(page->worker_running) {
++        return;
++    }
++
++    LfLabModel* model = view_get_model(page->view);
++    model->state = LfLabStateRunning;
++    model->status_msg[0] = '\0';
++    view_commit_model(page->view, true);
++
++    page->cancel_requested = false;
++    page->worker_running = true;
++    page->worker_thread = furi_thread_alloc_ex("LfLabWorker", 3072, lf_lab_worker, page);
++    furi_thread_start(page->worker_thread);
++}
++
++void lf_lab_page_stop(LfLabPage* page) {
++    if(!page) {
++        return;
++    }
++
++    if(page->worker_thread && page->worker_running) {
++        page->cancel_requested = true;
++        furi_thread_join(page->worker_thread);
++        page->worker_running = false;
++    }
++
++    lf_lab_cleanup_worker(page);
++
++    LfLabModel* model = view_get_model(page->view);
++    model->state = LfLabStateIdle;
++    view_commit_model(page->view, false);
++}
+diff --git a/pages/lf_lab_page.h b/pages/lf_lab_page.h
+new file mode 100644
+index 0000000..273ac97
+--- /dev/null
++++ b/pages/lf_lab_page.h
+@@ -0,0 +1,15 @@
++#ifndef LF_LAB_PAGE_H
++#define LF_LAB_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct LfLabPage LfLabPage;
++typedef void (*LfLabPageBackCallback)(void* context);
++
++LfLabPage* lf_lab_page_create(LfLabPageBackCallback back_callback, void* back_callback_context);
++void lf_lab_page_free(LfLabPage* page);
++View* lf_lab_page_get_view(LfLabPage* page);
++void lf_lab_page_start(LfLabPage* page);
++void lf_lab_page_stop(LfLabPage* page);
++
++#endif // LF_LAB_PAGE_H
+diff --git a/pages/pm5_control_page.c b/pages/pm5_control_page.c
+new file mode 100644
+index 0000000..ee1be86
+--- /dev/null
++++ b/pages/pm5_control_page.c
+@@ -0,0 +1,454 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <string.h>
++#include "pm5_control_page.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++typedef enum {
++    Pm5CtrlItemLfFreq = 0,
++    Pm5CtrlItemQFactor,
++    Pm5CtrlItemAntLeds,
++    Pm5CtrlItemRgbColor,
++    Pm5CtrlItemPowerSave,
++    Pm5CtrlItemCount,
++} Pm5CtrlItem;
++
++typedef struct {
++    const char* name;
++    uint8_t r;
++    uint8_t g;
++    uint8_t b;
++} Pm5RgbPreset;
++
++static const Pm5RgbPreset k_rgb_presets[] = {
++    {"Auto (Default)", 0, 0, 0},
++    {"Cyan", 0, 200, 255},
++    {"Green", 0, 255, 40},
++    {"Blue", 0, 60, 255},
++    {"Purple", 180, 0, 255},
++    {"Amber", 255, 140, 0},
++    {"Red", 255, 0, 0},
++};
++#define PM5_RGB_PRESET_COUNT (sizeof(k_rgb_presets) / sizeof(k_rgb_presets[0]))
++
++static const char* const k_lf_freq_names[5] = {
++    "125 kHz",
++    "134 kHz",
++    "250 kHz",
++    "375 kHz",
++    "500 kHz",
++};
++
++// One-hot bit layout of I2C 0x51 reg 0x02:
++// Bit 7 (0x80): 125k, Bit 6 (0x40): 134k, Bit 5 (0x20): 250k,
++// Bit 4 (0x10): 375k, Bit 3 (0x08): 500k,
++// Bit 2 (0x04): HF LED, Bit 1 (0x02): LF LED, Bit 0 (0x01): High Q
++static uint8_t pm5_ant_reg_to_freq_idx(uint8_t ant_reg) {
++    if(ant_reg & 0x80) return 0; // 125 kHz
++    if(ant_reg & 0x40) return 1; // 134 kHz
++    if(ant_reg & 0x20) return 2; // 250 kHz
++    if(ant_reg & 0x10) return 3; // 375 kHz
++    if(ant_reg & 0x08) return 4; // 500 kHz
++    return 0;
++}
++
++static uint8_t pm5_freq_idx_to_ant_mask(uint8_t freq_idx) {
++    if(freq_idx > 4) freq_idx = 0;
++    return (uint8_t)(0x80u >> freq_idx);
++}
++
++typedef struct {
++    bool synced;
++    bool busy;
++    bool error;
++    uint8_t cursor;
++    uint8_t ant_reg;     // I2C 0x51 reg 0x02
++    uint8_t rgb_idx;     // index into k_rgb_presets
++    bool powersave_on;   // CMD_PM5_POWERSAVE
++} Pm5ControlModel;
++
++typedef enum {
++    Pm5CtrlJobInit = 0,
++    Pm5CtrlJobWriteAnt,
++    Pm5CtrlJobWriteRgb,
++    Pm5CtrlJobWritePowersave,
++} Pm5CtrlJobType;
++
++struct Pm5ControlPage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_thread_running;
++    Pm5CtrlJobType job_type;
++    uint8_t pending_ant_reg;
++    uint8_t pending_rgb_idx;
++    bool pending_powersave;
++    Pm5ControlPageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static void pm5_control_launch_job(Pm5ControlPage* page, Pm5CtrlJobType job);
++
++static void pm5_control_draw_callback(Canvas* canvas, void* context) {
++    Pm5ControlModel* m = context;
++    if(!m) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str(canvas, 4, 10, "PM5 Hardware Ctrl");
++    canvas_set_font(canvas, FontSecondary);
++    if(m->busy) {
++        canvas_draw_str_aligned(canvas, 124, 10, AlignRight, AlignBottom, "Sync...");
++    } else if(m->error) {
++        canvas_draw_str_aligned(canvas, 124, 10, AlignRight, AlignBottom, "Err");
++    }
++
++    uint8_t freq_idx = pm5_ant_reg_to_freq_idx(m->ant_reg);
++    bool high_q = (m->ant_reg & 0x01) != 0;
++    bool lf_led = (m->ant_reg & 0x02) != 0;
++    bool hf_led = (m->ant_reg & 0x04) != 0;
++
++    const char* led_state_str = "Off";
++    if(hf_led && lf_led) {
++        led_state_str = "HF+LF On";
++    } else if(hf_led) {
++        led_state_str = "HF On";
++    } else if(lf_led) {
++        led_state_str = "LF On";
++    }
++
++    char rows[Pm5CtrlItemCount][40];
++    snprintf(rows[0], sizeof(rows[0]), "LF Resonance: %s", k_lf_freq_names[freq_idx]);
++    snprintf(
++        rows[1],
++        sizeof(rows[1]),
++        "Antenna Q:    %s",
++        high_q ? "High Q (125/134k)" : "Low Q (Std)");
++    snprintf(rows[2], sizeof(rows[2]), "Coil LEDs:    %s", led_state_str);
++    snprintf(rows[3], sizeof(rows[3]), "RGB Light:    %s", k_rgb_presets[m->rgb_idx].name);
++    snprintf(rows[4], sizeof(rows[4]), "MCU PwrSave:  %s", m->powersave_on ? "On (48MHz)" : "Off");
++
++    // Display 4 visible items with scrolling window
++    int first = 0;
++    if(m->cursor >= 4) {
++        first = m->cursor - 3;
++    }
++    int y = 20;
++    for(int i = 0; i < 4 && (first + i) < Pm5CtrlItemCount; i++) {
++        int idx = first + i;
++        char line[44];
++        snprintf(
++            line,
++            sizeof(line),
++            "%c %s",
++            (idx == m->cursor) ? '>' : ' ',
++            rows[idx]);
++        canvas_draw_str(canvas, 2, y, line);
++        y += 9;
++    }
++
++    elements_button_left(canvas, "Back");
++    if(!m->busy) {
++        elements_button_center(canvas, "Change");
++    }
++}
++
++static void pm5_control_cycle_selected(Pm5ControlPage* page) {
++    if(page->worker_thread_running) {
++        return;
++    }
++
++    Pm5ControlModel* m = view_get_model(page->view);
++    uint8_t cursor = m->cursor;
++    uint8_t ant_reg = m->ant_reg;
++    uint8_t rgb_idx = m->rgb_idx;
++    bool powersave = m->powersave_on;
++    view_commit_model(page->view, false);
++
++    if(cursor == Pm5CtrlItemLfFreq) {
++        uint8_t freq_idx = pm5_ant_reg_to_freq_idx(ant_reg);
++        freq_idx = (freq_idx + 1) % 5;
++        ant_reg = (ant_reg & 0x07) | pm5_freq_idx_to_ant_mask(freq_idx);
++        // Hardware rule: High Q (bit 0) is only allowed for 125 kHz (0) and 134 kHz (1)
++        if(freq_idx >= 2) {
++            ant_reg &= ~0x01;
++        }
++        page->pending_ant_reg = ant_reg;
++        pm5_control_launch_job(page, Pm5CtrlJobWriteAnt);
++    } else if(cursor == Pm5CtrlItemQFactor) {
++        uint8_t freq_idx = pm5_ant_reg_to_freq_idx(ant_reg);
++        if(freq_idx >= 2) {
++            // Reset to 125 kHz (0x80) if user enables High Q while on >=250 kHz
++            ant_reg = 0x80 | (ant_reg & 0x06) | 0x01;
++        } else {
++            if((ant_reg & 0xF8) == 0) {
++                ant_reg |= 0x80;
++            }
++            ant_reg ^= 0x01;
++        }
++        page->pending_ant_reg = ant_reg;
++        pm5_control_launch_job(page, Pm5CtrlJobWriteAnt);
++    } else if(cursor == Pm5CtrlItemAntLeds) {
++        if((ant_reg & 0xF8) == 0) {
++            ant_reg |= 0x80;
++        }
++        uint8_t leds = (ant_reg >> 1) & 0x03;
++        leds = (leds + 1) & 0x03;
++        ant_reg = (ant_reg & ~0x06) | (leds << 1);
++        page->pending_ant_reg = ant_reg;
++        pm5_control_launch_job(page, Pm5CtrlJobWriteAnt);
++    } else if(cursor == Pm5CtrlItemRgbColor) {
++        rgb_idx = (rgb_idx + 1) % PM5_RGB_PRESET_COUNT;
++        page->pending_rgb_idx = rgb_idx;
++        pm5_control_launch_job(page, Pm5CtrlJobWriteRgb);
++    } else if(cursor == Pm5CtrlItemPowerSave) {
++        page->pending_powersave = !powersave;
++        pm5_control_launch_job(page, Pm5CtrlJobWritePowersave);
++    }
++}
++
++static bool pm5_control_input_callback(InputEvent* event, void* context) {
++    Pm5ControlPage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        pm5_control_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort || event->type == InputTypeRepeat) {
++        if(event->key == InputKeyUp) {
++            Pm5ControlModel* m = view_get_model(page->view);
++            m->cursor = (m->cursor + Pm5CtrlItemCount - 1) % Pm5CtrlItemCount;
++            view_commit_model(page->view, true);
++            return true;
++        }
++        if(event->key == InputKeyDown) {
++            Pm5ControlModel* m = view_get_model(page->view);
++            m->cursor = (m->cursor + 1) % Pm5CtrlItemCount;
++            view_commit_model(page->view, true);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort &&
++       (event->key == InputKeyOk || event->key == InputKeyRight)) {
++        pm5_control_cycle_selected(page);
++        return true;
++    }
++
++    return false;
++}
++
++static void pm5_control_cleanup_worker(Pm5ControlPage* page) {
++    if(!page || !page->worker_thread || page->worker_thread_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t pm5_control_worker(void* context) {
++    Pm5ControlPage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        Pm5ControlModel* m = view_get_model(page->view);
++        m->busy = false;
++        m->error = true;
++        view_commit_model(page->view, true);
++        page->worker_thread_running = false;
++        return 0;
++    }
++
++    bool ok = false;
++    uint8_t read_ant = 0;
++
++    if(page->job_type == Pm5CtrlJobInit) {
++        uint8_t reg_type = 1; // map reg (0x02)
++        if(proxmark5_com_request_ng(
++               CMD_ANT_CONTROL_READ, &reg_type, 1, CMD_ANT_CONTROL_READ, resp, 1000, 2) &&
++           resp->status == PM3_SUCCESS && resp->length >= 1) {
++            read_ant = resp->data.asBytes[0];
++            ok = true;
++        }
++    } else if(page->job_type == Pm5CtrlJobWriteAnt) {
++        struct {
++            uint8_t data;
++            uint8_t reg_type;
++        } PACKED payload = {
++            .data = page->pending_ant_reg,
++            .reg_type = 1,
++        };
++        if(proxmark5_com_request_ng(
++               CMD_ANT_CONTROL_WRITE,
++               (uint8_t*)&payload,
++               sizeof(payload),
++               CMD_ANT_CONTROL_WRITE,
++               resp,
++               1000,
++               2) &&
++           resp->status == PM3_SUCCESS) {
++            read_ant = page->pending_ant_reg;
++            ok = true;
++        }
++    } else if(page->job_type == Pm5CtrlJobWriteRgb) {
++        const Pm5RgbPreset* p = &k_rgb_presets[page->pending_rgb_idx];
++        struct {
++            uint8_t r;
++            uint8_t g;
++            uint8_t b;
++        } PACKED rgb = {
++            .r = p->r,
++            .g = p->g,
++            .b = p->b,
++        };
++        if(proxmark5_com_request_ng(
++               CMD_PM5_RGB_SET, (uint8_t*)&rgb, sizeof(rgb), CMD_PM5_RGB_SET, resp, 1000, 2) &&
++           resp->status == PM3_SUCCESS) {
++            ok = true;
++        }
++    } else if(page->job_type == Pm5CtrlJobWritePowersave) {
++        uint8_t en = page->pending_powersave ? 1 : 0;
++        if(proxmark5_com_request_ng(
++               CMD_PM5_POWERSAVE, &en, 1, CMD_PM5_POWERSAVE, resp, 1000, 2) &&
++           resp->status == PM3_SUCCESS) {
++            ok = true;
++        }
++    }
++
++    Pm5ControlModel* m = view_get_model(page->view);
++    m->busy = false;
++    m->error = !ok;
++    if(ok) {
++        if(page->job_type == Pm5CtrlJobInit || page->job_type == Pm5CtrlJobWriteAnt) {
++            m->ant_reg = read_ant;
++            m->synced = true;
++            FURI_LOG_I("PM5_QA_Ctrl", "ANT reg=0x%02X job=%d OK", read_ant, page->job_type);
++        } else if(page->job_type == Pm5CtrlJobWriteRgb) {
++            m->rgb_idx = page->pending_rgb_idx;
++            FURI_LOG_I(
++                "PM5_QA_Ctrl",
++                "RGB preset=%s OK",
++                k_rgb_presets[m->rgb_idx].name);
++        } else if(page->job_type == Pm5CtrlJobWritePowersave) {
++            m->powersave_on = page->pending_powersave;
++            FURI_LOG_I("PM5_QA_Ctrl", "POWERSAVE=%d OK", m->powersave_on ? 1 : 0);
++        }
++    } else {
++        FURI_LOG_W("PM5_QA_Ctrl", "Job %d FAILED", page->job_type);
++    }
++    view_commit_model(page->view, true);
++
++    free(resp);
++    page->worker_thread_running = false;
++    return 0;
++}
++
++static void pm5_control_launch_job(Pm5ControlPage* page, Pm5CtrlJobType job) {
++    if(!page || !page->view) {
++        return;
++    }
++    pm5_control_cleanup_worker(page);
++    if(page->worker_thread) {
++        return;
++    }
++
++    page->job_type = job;
++    Pm5ControlModel* m = view_get_model(page->view);
++    m->busy = true;
++    m->error = false;
++    view_commit_model(page->view, true);
++
++    page->worker_thread =
++        furi_thread_alloc_ex("Pm5ControlTask", 4096, pm5_control_worker, page);
++    if(!page->worker_thread) {
++        m = view_get_model(page->view);
++        m->busy = false;
++        m->error = true;
++        view_commit_model(page->view, true);
++        return;
++    }
++
++    page->worker_thread_running = true;
++    furi_thread_start(page->worker_thread);
++}
++
++Pm5ControlPage* pm5_control_page_create(
++    Pm5ControlPageBackCallback back_callback,
++    void* back_callback_context) {
++    Pm5ControlPage* page = calloc(1, sizeof(Pm5ControlPage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(Pm5ControlModel));
++    view_set_draw_callback(page->view, pm5_control_draw_callback);
++    view_set_input_callback(page->view, pm5_control_input_callback);
++
++    Pm5ControlModel* m = view_get_model(page->view);
++    m->synced = false;
++    m->busy = false;
++    m->error = false;
++    m->cursor = 0;
++    m->ant_reg = 0x80;
++    m->rgb_idx = 0;
++    m->powersave_on = true;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void pm5_control_page_free(Pm5ControlPage* page) {
++    if(!page) {
++        return;
++    }
++    if(page->worker_thread) {
++        furi_thread_join(page->worker_thread);
++        furi_thread_free(page->worker_thread);
++        page->worker_thread = NULL;
++        page->worker_thread_running = false;
++    }
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++    free(page);
++}
++
++View* pm5_control_page_get_view(Pm5ControlPage* page) {
++    return page ? page->view : NULL;
++}
++
++void pm5_control_page_start(Pm5ControlPage* page) {
++    pm5_control_launch_job(page, Pm5CtrlJobInit);
++}
++
++void pm5_control_page_stop(Pm5ControlPage* page) {
++    UNUSED(page);
++}
+diff --git a/pages/pm5_control_page.h b/pages/pm5_control_page.h
+new file mode 100644
+index 0000000..08252f9
+--- /dev/null
++++ b/pages/pm5_control_page.h
+@@ -0,0 +1,16 @@
++#ifndef PM5_CONTROL_PAGE_H
++#define PM5_CONTROL_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct Pm5ControlPage Pm5ControlPage;
++typedef void (*Pm5ControlPageBackCallback)(void* context);
++
++Pm5ControlPage*
++    pm5_control_page_create(Pm5ControlPageBackCallback back_callback, void* back_callback_context);
++void pm5_control_page_free(Pm5ControlPage* page);
++View* pm5_control_page_get_view(Pm5ControlPage* page);
++void pm5_control_page_start(Pm5ControlPage* page);
++void pm5_control_page_stop(Pm5ControlPage* page);
++
++#endif // PM5_CONTROL_PAGE_H
+diff --git a/pages/read_hitag2_page.c b/pages/read_hitag2_page.c
+index 4aea7f0..ca74aa0 100644
+--- a/pages/read_hitag2_page.c
++++ b/pages/read_hitag2_page.c
+@@ -10,6 +10,7 @@ typedef enum {
+     ReadHitag2PageStateIdle,
+     ReadHitag2PageStateRunning,
+     ReadHitag2PageStateSuccess,
++    ReadHitag2PageStateNotFound,
+     ReadHitag2PageStateTimeout,
+     ReadHitag2PageStateError,
+ } ReadHitag2PageState;
+@@ -81,7 +82,7 @@ static const char* getHitagTypeStr(uint32_t uid) {
+     case 9:
+         return "PCF 7945";
+     default:
+-        return "";
++        return "Hitag2";
+     }
+ }
+ 
+@@ -108,67 +109,57 @@ static int
+ 
+     memset(packet, 0, sizeof(lf_hitag_data_t));
+ 
+-    uint8_t key[6];
+-    memcpy(key, "MIKR", 4);
+-
++    // Use HT2F_UID_ONLY so PM5 executes ht2_read_uid(), which works reliably over
++    // CEP SPI for both Password and Crypto Hitag2 tags without aborting on RDBF.
+     int pm3cmd = CMD_LF_HITAG_READER;
+-    packet->cmd = HT2F_PASSWORD;
+-    memcpy(packet->pwd, key, sizeof(packet->pwd));
+-
+-    FURI_LOG_I("ReadHitag2Page", "Sending Hitag2 read command to Proxmark5");
+-
+-    clearCommandBuffer();
+-
+-    if(cancel_requested && *cancel_requested) {
+-        free(packet);
+-        free(resp);
+-        return PM3_EOPABORTED;
+-    }
+-
+-    SendCommandNG(pm3cmd, (uint8_t*)packet, sizeof(lf_hitag_data_t));
++    packet->cmd = HT2F_UID_ONLY;
+ 
+-    FURI_LOG_I("ReadHitag2Page", "Waiting for Hitag2 response from Proxmark5");
+-
+-    int wait_result =
+-        read_hitag2_wait_for_response_interruptible(pm3cmd, resp, 2000, cancel_requested);
+-    if(wait_result != PM3_SUCCESS) {
+-        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+-        free(packet);
+-        free(resp);
+-        if(wait_result == PM3_EOPABORTED) {
+-            FURI_LOG_I("ReadHitag2Page", "Hitag2 read canceled");
+-        } else {
+-            FURI_LOG_W("ReadHitag2Page", "Wait for Hitag2 response timeout");
++    int final_res = PM3_EFAILED;
++    for(int attempt = 0; attempt < 3; attempt++) {
++        if(cancel_requested && *cancel_requested) {
++            free(packet);
++            free(resp);
++            return PM3_EOPABORTED;
+         }
+-        return wait_result;
+-    }
+ 
+-    FURI_LOG_I(
+-        "ReadHitag2Page", "Received Hitag2 response from Proxmark5, status=%d", resp->status);
+-
+-    if(resp->status != PM3_SUCCESS) {
+-        FURI_LOG_W("ReadHitag2Page", "Hitag2 operation failed");
+-        free(packet);
+-        free(resp);
+-        return PM3_ESOFT;
+-    }
+-
+-    if(resp->length >= HITAG_UID_SIZE) {
+-        uint32_t uid = ((uint32_t)resp->data.asBytes[0] << 24) |
+-                       ((uint32_t)resp->data.asBytes[1] << 16) |
+-                       ((uint32_t)resp->data.asBytes[2] << 8) | (uint32_t)resp->data.asBytes[3];
+-        if(out_uid) {
+-            *out_uid = uid;
++        clearCommandBuffer();
++        SendCommandNG(pm3cmd, (uint8_t*)packet, sizeof(lf_hitag_data_t));
++
++        int wait_result =
++            read_hitag2_wait_for_response_interruptible(pm3cmd, resp, 1500, cancel_requested);
++        if(wait_result != PM3_SUCCESS) {
++            if(wait_result == PM3_EOPABORTED) {
++                free(packet);
++                free(resp);
++                return PM3_EOPABORTED;
++            }
++            final_res = wait_result;
++            continue;
+         }
+-        if(out_uid_valid) {
+-            *out_uid_valid = true;
++
++        if(resp->status == PM3_SUCCESS && resp->length >= HITAG_UID_SIZE) {
++            uint32_t uid = ((uint32_t)resp->data.asBytes[0] << 24) |
++                           ((uint32_t)resp->data.asBytes[1] << 16) |
++                           ((uint32_t)resp->data.asBytes[2] << 8) |
++                           (uint32_t)resp->data.asBytes[3];
++            if(out_uid) {
++                *out_uid = uid;
++            }
++            if(out_uid_valid) {
++                *out_uid_valid = true;
++            }
++            free(packet);
++            free(resp);
++            return PM3_SUCCESS;
+         }
++
++        final_res = resp->status;
++        furi_delay_ms(80);
+     }
+ 
+     free(packet);
+     free(resp);
+-
+-    return PM3_SUCCESS;
++    return final_res;
+ }
+ 
+ static void read_hitag2_page_draw_callback(Canvas* canvas, void* context) {
+@@ -179,51 +170,48 @@ static void read_hitag2_page_draw_callback(Canvas* canvas, void* context) {
+ 
+     canvas_clear(canvas);
+     canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str(canvas, 4, 14, "LF Hitag2 Reader");
++    canvas_set_font(canvas, FontSecondary);
+ 
+     switch(model->state) {
+     case ReadHitag2PageStateIdle:
+-        canvas_draw_str(canvas, 4, 16, "Read Hitag2");
+-        canvas_set_font(canvas, FontSecondary);
+-        canvas_draw_str(canvas, 4, 34, "Waiting to start...");
++        canvas_draw_str(canvas, 4, 32, "Press Scan to read tag");
+         break;
+     case ReadHitag2PageStateRunning:
+-        canvas_draw_str(canvas, 4, 16, "Read Hitag2");
+-        canvas_set_font(canvas, FontSecondary);
+-        canvas_draw_str(canvas, 4, 34, "Reading... please wait");
++        canvas_draw_str(canvas, 4, 32, "Scanning 125 kHz field...");
++        canvas_draw_str(canvas, 4, 44, "Place Hitag2 tag on LF coil");
+         break;
+     case ReadHitag2PageStateSuccess:
+-        canvas_draw_str(canvas, 4, 16, "Read Hitag2");
+-        canvas_set_font(canvas, FontSecondary);
+-        canvas_draw_str(canvas, 4, 30, "Read success");
+         if(model->uid_valid) {
+             const char* type_str = getHitagTypeStr(model->uid);
+-            char uid_type_str[48] = {0x00};
+-            snprintf(
+-                uid_type_str,
+-                sizeof(uid_type_str),
+-                "UID:%08lX Type:%s",
+-                (unsigned long)model->uid,
+-                type_str ? type_str : "n/a");
+-            canvas_draw_str(canvas, 4, 42, uid_type_str);
++            char uid_line[32];
++            char type_line[40];
++            snprintf(uid_line, sizeof(uid_line), "UID:  %08lX", (unsigned long)model->uid);
++            snprintf(type_line, sizeof(type_line), "Chip: %s", type_str ? type_str : "Hitag2");
++            canvas_draw_str(canvas, 4, 29, uid_line);
++            canvas_draw_str(canvas, 4, 41, type_line);
+         } else {
+-            canvas_draw_str(canvas, 4, 42, "UID:n/a Type:n/a");
++            canvas_draw_str(canvas, 4, 34, "UID: n/a");
+         }
+         break;
++    case ReadHitag2PageStateNotFound:
++        canvas_draw_str(canvas, 4, 32, "No Hitag2 tag detected");
++        canvas_draw_str(canvas, 4, 44, "Place tag on LF coil & Scan");
++        break;
+     case ReadHitag2PageStateTimeout:
+-        canvas_draw_str(canvas, 4, 16, "Read Hitag2");
+-        canvas_set_font(canvas, FontSecondary);
+-        canvas_draw_str(canvas, 4, 34, "Read timeout");
++        canvas_draw_str(canvas, 4, 34, "Device not responding");
+         break;
+     case ReadHitag2PageStateError:
+-        canvas_draw_str(canvas, 4, 16, "Read Hitag2");
+-        canvas_set_font(canvas, FontSecondary);
+-        canvas_draw_str(canvas, 4, 34, "Read failed");
++        canvas_draw_str(canvas, 4, 34, "Read error");
+         break;
+     default:
+         break;
+     }
+ 
+     elements_button_left(canvas, "Back");
++    if(model->state != ReadHitag2PageStateRunning) {
++        elements_button_center(canvas, "Scan");
++    }
+ }
+ 
+ static bool read_hitag2_page_input_callback(InputEvent* event, void* context) {
+@@ -232,9 +220,6 @@ static bool read_hitag2_page_input_callback(InputEvent* event, void* context) {
+         return false;
+     }
+ 
+-    // The page draws a left "Back" button, so it has to actually do something.
+-    // InputKeyBack is deliberately left unhandled: the ViewDispatcher routes it
+-    // through the view's previous-callback, which already leaves the page.
+     if(event->type == InputTypeShort && event->key == InputKeyLeft) {
+         read_hitag2_page_stop(read_hitag2_page);
+         if(read_hitag2_page->back_callback) {
+@@ -243,6 +228,13 @@ static bool read_hitag2_page_input_callback(InputEvent* event, void* context) {
+         return true;
+     }
+ 
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!read_hitag2_page->worker_thread_running) {
++            read_hitag2_page_start(read_hitag2_page);
++            return true;
++        }
++    }
++
+     return false;
+ }
+ 
+@@ -277,12 +269,18 @@ static int32_t read_hitag2_page_worker(void* context) {
+         model->state = ReadHitag2PageStateSuccess;
+         model->uid = uid;
+         model->uid_valid = uid_valid;
++        FURI_LOG_I("PM5_QA_Hitag2", "Tag found: UID=%08lX", (unsigned long)uid);
+     } else if(result == PM3_EOPABORTED) {
+         model->state = ReadHitag2PageStateIdle;
++    } else if(result == PM3_EFAILED) {
++        model->state = ReadHitag2PageStateNotFound;
++        FURI_LOG_I("PM5_QA_Hitag2", "OK (No Hitag2 tag in field)");
+     } else if(result == PM3_ETIMEOUT) {
+         model->state = ReadHitag2PageStateTimeout;
++        FURI_LOG_W("PM5_QA_Hitag2", "TIMEOUT");
+     } else {
+         model->state = ReadHitag2PageStateError;
++        FURI_LOG_W("PM5_QA_Hitag2", "ERROR res=%d", result);
+     }
+     view_commit_model(read_hitag2_page->view, true);
+ 
+diff --git a/pages/rf_scope_page.c b/pages/rf_scope_page.c
+new file mode 100644
+index 0000000..9ce7717
+--- /dev/null
++++ b/pages/rf_scope_page.c
+@@ -0,0 +1,445 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <stdio.h>
++#include <string.h>
++#include "rf_scope_page.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++#define SCOPE_SAMPLES 116U
++
++typedef enum {
++    RfScopeBandHf1356 = 0,
++    RfScopeBandLf125 = 1,
++    RfScopeBandLf134 = 2,
++    RfScopeBandCount = 3,
++} RfScopeBand;
++
++typedef struct {
++    bool running;
++    RfScopeBand band;
++    uint32_t current_mv;
++    uint32_t peak_mv;
++    uint16_t history_mv[SCOPE_SAMPLES];
++    uint8_t sample_count;
++} RfScopeModel;
++
++struct RfScopePage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_running;
++    volatile bool cancel_requested;
++    volatile bool reset_peak_requested;
++    volatile RfScopeBand requested_band;
++
++    RfScopePageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static const char* const k_band_names[RfScopeBandCount] = {
++    "HF 13.56M",
++    "LF 125.0k",
++    "LF 134.8k",
++};
++
++static void rf_scope_format_volts(uint32_t mv, char* out, size_t out_size) {
++    uint32_t v_int = mv / 1000U;
++    uint32_t v_frac = (mv % 1000U) / 10U;
++    snprintf(out, out_size, "%lu.%02luV", (unsigned long)v_int, (unsigned long)v_frac);
++}
++
++static void rf_scope_set_smart_antenna_lf(RfScopeBand band, PacketResponseNG* resp) {
++    if(band == RfScopeBandHf1356) return;
++    struct {
++        uint8_t data;
++        uint8_t reg_type;
++    } PACKED ant_cmd = {
++        .data = (band == RfScopeBandLf125) ? 0x81 : 0x41,
++        .reg_type = 1,
++    };
++    proxmark5_com_request_ng(
++        CMD_ANT_CONTROL_WRITE,
++        (uint8_t*)&ant_cmd,
++        sizeof(ant_cmd),
++        CMD_ANT_CONTROL_WRITE,
++        resp,
++        300,
++        1);
++}
++
++static bool rf_scope_band_start(RfScopeBand band, PacketResponseNG* resp) {
++    if(band == RfScopeBandHf1356) {
++        uint8_t act = 1;
++        return proxmark5_com_request_ng(
++            CMD_MEASURE_ANTENNA_TUNING_HF,
++            &act,
++            1,
++            CMD_MEASURE_ANTENNA_TUNING_HF,
++            resp,
++            1200,
++            2);
++    } else {
++        rf_scope_set_smart_antenna_lf(band, resp);
++        uint8_t divisor = (band == RfScopeBandLf125) ? 95 : 88;
++        uint8_t req[2] = {1, divisor};
++        return proxmark5_com_request_ng(
++            CMD_MEASURE_ANTENNA_TUNING_LF,
++            req,
++            sizeof(req),
++            CMD_MEASURE_ANTENNA_TUNING_LF,
++            resp,
++            1200,
++            2);
++    }
++}
++
++static void rf_scope_band_stop(RfScopeBand band, PacketResponseNG* resp) {
++    if(band == RfScopeBandHf1356) {
++        uint8_t act = 3;
++        proxmark5_com_request_ng(
++            CMD_MEASURE_ANTENNA_TUNING_HF,
++            &act,
++            1,
++            CMD_MEASURE_ANTENNA_TUNING_HF,
++            resp,
++            600,
++            1);
++    } else {
++        uint8_t divisor = (band == RfScopeBandLf125) ? 95 : 88;
++        uint8_t req[2] = {3, divisor};
++        proxmark5_com_request_ng(
++            CMD_MEASURE_ANTENNA_TUNING_LF,
++            req,
++            sizeof(req),
++            CMD_MEASURE_ANTENNA_TUNING_LF,
++            resp,
++            600,
++            1);
++    }
++}
++
++static bool rf_scope_band_sample(RfScopeBand band, PacketResponseNG* resp, uint32_t* out_mv) {
++    if(band == RfScopeBandHf1356) {
++        uint8_t act = 2;
++        clearCommandBuffer();
++        SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_HF, &act, 1);
++        if(WaitForResponseTimeout(CMD_MEASURE_ANTENNA_TUNING_HF, resp, 350) &&
++           resp->status == PM3_SUCCESS && resp->length >= sizeof(uint32_t)) {
++            uint32_t mv = (uint32_t)resp->data.asBytes[0] |
++                          ((uint32_t)resp->data.asBytes[1] << 8) |
++                          ((uint32_t)resp->data.asBytes[2] << 16) |
++                          ((uint32_t)resp->data.asBytes[3] << 24);
++            *out_mv = mv;
++            return true;
++        }
++    } else {
++        uint8_t divisor = (band == RfScopeBandLf125) ? 95 : 88;
++        uint8_t req[2] = {2, divisor};
++        clearCommandBuffer();
++        SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_LF, req, sizeof(req));
++        if(WaitForResponseTimeout(CMD_MEASURE_ANTENNA_TUNING_LF, resp, 350) &&
++           resp->status == PM3_SUCCESS && resp->length >= sizeof(uint32_t)) {
++            uint32_t mv = (uint32_t)resp->data.asBytes[0] |
++                          ((uint32_t)resp->data.asBytes[1] << 8) |
++                          ((uint32_t)resp->data.asBytes[2] << 16) |
++                          ((uint32_t)resp->data.asBytes[3] << 24);
++            *out_mv = mv;
++            return true;
++        }
++    }
++    return false;
++}
++
++static void rf_scope_page_draw_callback(Canvas* canvas, void* context) {
++    RfScopeModel* model = context;
++    if(!model) {
++        return;
++    }
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontSecondary);
++
++    char now_str[16];
++    char peak_str[16];
++    rf_scope_format_volts(model->current_mv, now_str, sizeof(now_str));
++    rf_scope_format_volts(model->peak_mv, peak_str, sizeof(peak_str));
++
++    uint32_t drop_pct = 0;
++    if(model->peak_mv > 0 && model->current_mv < model->peak_mv) {
++        drop_pct = ((model->peak_mv - model->current_mv) * 100U) / model->peak_mv;
++    }
++
++    char line1[44];
++    snprintf(
++        line1,
++        sizeof(line1),
++        "[%s] Now:%s",
++        k_band_names[model->band],
++        now_str);
++    canvas_draw_str(canvas, 2, 8, line1);
++
++    char line2[44];
++    snprintf(
++        line2,
++        sizeof(line2),
++        "Peak:%s  LoadDrop:%lu%%",
++        peak_str,
++        (unsigned long)drop_pct);
++    canvas_draw_str(canvas, 2, 17, line2);
++
++    // Oscilloscope viewport: X=4..123 (width 120), Y=19..50 (height 32)
++    const uint8_t box_x = 4;
++    const uint8_t box_y = 19;
++    const uint8_t box_w = 120;
++    const uint8_t box_h = 32;
++    canvas_draw_frame(canvas, box_x, box_y, box_w, box_h);
++
++    // Dotted midline
++    for(uint8_t gx = box_x + 2; gx < box_x + box_w - 2; gx += 4) {
++        canvas_draw_dot(canvas, gx, box_y + box_h / 2);
++    }
++
++    uint32_t scale_max = model->peak_mv > 5000U ? model->peak_mv : 45000U;
++    uint8_t prev_x = 0;
++    uint8_t prev_y = 0;
++    for(uint8_t i = 0; i < SCOPE_SAMPLES; i++) {
++        uint32_t mv = model->history_mv[i];
++        if(mv > scale_max) mv = scale_max;
++        uint8_t plot_h = (uint8_t)((mv * (box_h - 4U)) / scale_max);
++        uint8_t x = (uint8_t)(box_x + 2U + i);
++        uint8_t y = (uint8_t)(box_y + box_h - 2U - plot_h);
++        if(i == 0) {
++            canvas_draw_dot(canvas, x, y);
++        } else {
++            canvas_draw_line(canvas, prev_x, prev_y, x, y);
++        }
++        prev_x = x;
++        prev_y = y;
++    }
++
++    elements_button_left(canvas, "Back");
++    elements_button_center(canvas, model->running ? "Pause" : "Run");
++    elements_button_right(canvas, "Zero");
++}
++
++static bool rf_scope_page_input_callback(InputEvent* event, void* context) {
++    RfScopePage* page = context;
++    if(!page || !event) {
++        return false;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        rf_scope_page_stop(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(page->worker_running) {
++            rf_scope_page_stop(page);
++        } else {
++            rf_scope_page_start(page);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        page->reset_peak_requested = true;
++        RfScopeModel* model = view_get_model(page->view);
++        model->peak_mv = model->current_mv;
++        view_commit_model(page->view, true);
++        return true;
++    }
++
++    if(event->type == InputTypeShort &&
++       (event->key == InputKeyUp || event->key == InputKeyDown)) {
++        RfScopeModel* model = view_get_model(page->view);
++        RfScopeBand next_band = model->band;
++        if(event->key == InputKeyUp) {
++            next_band = (next_band == 0) ? (RfScopeBand)(RfScopeBandCount - 1) :
++                                           (RfScopeBand)(next_band - 1);
++        } else {
++            next_band = (RfScopeBand)((next_band + 1) % RfScopeBandCount);
++        }
++        model->band = next_band;
++        model->peak_mv = 0;
++        memset(model->history_mv, 0, sizeof(model->history_mv));
++        page->requested_band = next_band;
++        view_commit_model(page->view, true);
++        return true;
++    }
++
++    return false;
++}
++
++static void rf_scope_cleanup_worker(RfScopePage* page) {
++    if(!page || !page->worker_thread || page->worker_running) {
++        return;
++    }
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++}
++
++static int32_t rf_scope_worker(void* context) {
++    RfScopePage* page = context;
++    if(!page) {
++        return 0;
++    }
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        page->worker_running = false;
++        return 0;
++    }
++
++    RfScopeBand active_band = page->requested_band;
++    rf_scope_band_start(active_band, resp);
++    bool logged_qa = false;
++
++    while(!page->cancel_requested) {
++        if(page->requested_band != active_band) {
++            rf_scope_band_stop(active_band, resp);
++            active_band = page->requested_band;
++            rf_scope_band_start(active_band, resp);
++        }
++
++        uint32_t mv = 0;
++        if(rf_scope_band_sample(active_band, resp, &mv)) {
++            RfScopeModel* model = view_get_model(page->view);
++            if(page->reset_peak_requested) {
++                model->peak_mv = mv;
++                page->reset_peak_requested = false;
++            }
++            model->current_mv = mv;
++            if(mv > model->peak_mv) {
++                model->peak_mv = mv;
++            }
++            memmove(
++                &model->history_mv[0],
++                &model->history_mv[1],
++                (SCOPE_SAMPLES - 1U) * sizeof(uint16_t));
++            model->history_mv[SCOPE_SAMPLES - 1U] = (uint16_t)(mv > 65535U ? 65535U : mv);
++            if(model->sample_count < 250) {
++                model->sample_count++;
++            }
++            if(!logged_qa && model->sample_count >= 3) {
++                logged_qa = true;
++                FURI_LOG_I(
++                    "PM5_QA_RFSCOPE",
++                    "Band=%s Now=%lu mV Peak=%lu mV",
++                    k_band_names[active_band],
++                    (unsigned long)mv,
++                    (unsigned long)model->peak_mv);
++            }
++            view_commit_model(page->view, true);
++        }
++
++        furi_delay_ms(35);
++    }
++
++    rf_scope_band_stop(active_band, resp);
++    free(resp);
++
++    RfScopeModel* model = view_get_model(page->view);
++    model->running = false;
++    view_commit_model(page->view, true);
++
++    page->worker_running = false;
++    return 0;
++}
++
++RfScopePage*
++    rf_scope_page_create(RfScopePageBackCallback back_callback, void* back_callback_context) {
++    RfScopePage* page = calloc(1, sizeof(RfScopePage));
++    if(!page) {
++        return NULL;
++    }
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++    page->requested_band = RfScopeBandHf1356;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(RfScopeModel));
++    view_set_draw_callback(page->view, rf_scope_page_draw_callback);
++    view_set_input_callback(page->view, rf_scope_page_input_callback);
++
++    RfScopeModel* model = view_get_model(page->view);
++    memset(model, 0, sizeof(*model));
++    model->band = RfScopeBandHf1356;
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void rf_scope_page_free(RfScopePage* page) {
++    if(!page) {
++        return;
++    }
++
++    rf_scope_page_stop(page);
++
++    if(page->view) {
++        view_set_context(page->view, NULL);
++        view_free_model(page->view);
++        view_free(page->view);
++        page->view = NULL;
++    }
++
++    free(page);
++}
++
++View* rf_scope_page_get_view(RfScopePage* page) {
++    return page ? page->view : NULL;
++}
++
++void rf_scope_page_start(RfScopePage* page) {
++    if(!page) {
++        return;
++    }
++
++    rf_scope_cleanup_worker(page);
++    if(page->worker_running) {
++        return;
++    }
++
++    RfScopeModel* model = view_get_model(page->view);
++    model->running = true;
++    model->sample_count = 0;
++    page->requested_band = model->band;
++    view_commit_model(page->view, true);
++
++    page->cancel_requested = false;
++    page->worker_running = true;
++    page->worker_thread = furi_thread_alloc_ex("RfScopeWorker", 2560, rf_scope_worker, page);
++    furi_thread_start(page->worker_thread);
++}
++
++void rf_scope_page_stop(RfScopePage* page) {
++    if(!page) {
++        return;
++    }
++
++    if(page->worker_thread && page->worker_running) {
++        page->cancel_requested = true;
++        furi_thread_join(page->worker_thread);
++        page->worker_running = false;
++    }
++
++    rf_scope_cleanup_worker(page);
++
++    RfScopeModel* model = view_get_model(page->view);
++    model->running = false;
++    view_commit_model(page->view, false);
++}
+diff --git a/pages/rf_scope_page.h b/pages/rf_scope_page.h
+new file mode 100644
+index 0000000..ca342eb
+--- /dev/null
++++ b/pages/rf_scope_page.h
+@@ -0,0 +1,15 @@
++#ifndef RF_SCOPE_PAGE_H
++#define RF_SCOPE_PAGE_H
++
++#include <gui/view.h>
++
++typedef struct RfScopePage RfScopePage;
++typedef void (*RfScopePageBackCallback)(void* context);
++
++RfScopePage* rf_scope_page_create(RfScopePageBackCallback back_callback, void* back_callback_context);
++void rf_scope_page_free(RfScopePage* page);
++View* rf_scope_page_get_view(RfScopePage* page);
++void rf_scope_page_start(RfScopePage* page);
++void rf_scope_page_stop(RfScopePage* page);
++
++#endif // RF_SCOPE_PAGE_H
+diff --git a/pages/t5577_crypto.c b/pages/t5577_crypto.c
+new file mode 100644
+index 0000000..ad0a9dd
+--- /dev/null
++++ b/pages/t5577_crypto.c
+@@ -0,0 +1,134 @@
++#include "t5577_crypto.h"
++#include <string.h>
++#include <stdio.h>
++
++static inline uint32_t rotl32(uint32_t value, unsigned int count) {
++    const unsigned int mask = 31;
++    count &= mask;
++    return (value << count) | (value >> ((-count) & mask));
++}
++
++uint32_t t5577_white_pwdgen(uint32_t card_id) {
++    uint32_t r1 = rotl32(card_id & 0x000000ECU, 8);
++    uint32_t r2 = rotl32(card_id & 0x86000000U, 16);
++    uint32_t pwd = 0x00010303U;
++    pwd += ((card_id & 0x86EE00ECU) ^ r1 ^ r2);
++    return pwd;
++}
++
++void t5577_build_em4100_blocks(const uint8_t uid[5], uint32_t* out_hi, uint32_t* out_lo) {
++    if(!out_hi || !out_lo) return;
++
++    // 9-bit leading 1s header
++    uint64_t frame = 0x1FFULL;
++    int col_parity[4] = {0, 0, 0, 0};
++
++    // 10 nibbles from 5 bytes
++    for(int i = 0; i < 10; i++) {
++        uint8_t byte = uid[i / 2];
++        uint8_t nibble = (i % 2 == 0) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
++
++        int row_parity = 0;
++        for(int b = 3; b >= 0; b--) {
++            int bit = (nibble >> b) & 1;
++            frame = (frame << 1) | bit;
++            row_parity ^= bit;
++            col_parity[3 - b] ^= bit;
++        }
++        // 1 even parity bit after each 4-bit nibble
++        frame = (frame << 1) | row_parity;
++    }
++
++    // 4 column parity bits
++    for(int c = 0; c < 4; c++) {
++        frame = (frame << 1) | col_parity[c];
++    }
++
++    // 1 stop bit (0)
++    frame = (frame << 1) | 0;
++
++    *out_hi = (uint32_t)(frame >> 32);
++    *out_lo = (uint32_t)(frame & 0xFFFFFFFFULL);
++}
++
++void t5577_parse_config_block0(uint32_t block0, T5577ConfigInfo* info) {
++    if(!info) return;
++    memset(info, 0, sizeof(*info));
++
++    // Modulation: bits 16..12
++    uint8_t mod = (block0 >> 12) & 0x1F;
++    switch(mod) {
++    case 0x00:
++        strncpy(info->modulation, "Direct", sizeof(info->modulation));
++        break;
++    case 0x01:
++        strncpy(info->modulation, "PSK1", sizeof(info->modulation));
++        break;
++    case 0x02:
++        strncpy(info->modulation, "PSK2", sizeof(info->modulation));
++        break;
++    case 0x03:
++        strncpy(info->modulation, "PSK3", sizeof(info->modulation));
++        break;
++    case 0x04:
++        strncpy(info->modulation, "FSK1", sizeof(info->modulation));
++        break;
++    case 0x05:
++        strncpy(info->modulation, "FSK2", sizeof(info->modulation));
++        break;
++    case 0x06:
++        strncpy(info->modulation, "FSK1a", sizeof(info->modulation));
++        break;
++    case 0x07:
++        strncpy(info->modulation, "FSK2a", sizeof(info->modulation));
++        break;
++    case 0x08:
++        strncpy(info->modulation, "Manchester", sizeof(info->modulation));
++        break;
++    case 0x10:
++        strncpy(info->modulation, "BiPhase", sizeof(info->modulation));
++        break;
++    case 0x18:
++        strncpy(info->modulation, "DiPhase", sizeof(info->modulation));
++        break;
++    default:
++        strncpy(info->modulation, "Custom", sizeof(info->modulation));
++        break;
++    }
++
++    // Bitrate: bits 20..18
++    uint8_t rate_idx = (block0 >> 18) & 0x07;
++    switch(rate_idx) {
++    case 0:
++        strncpy(info->bitrate, "RF/8", sizeof(info->bitrate));
++        break;
++    case 1:
++        strncpy(info->bitrate, "RF/16", sizeof(info->bitrate));
++        break;
++    case 2:
++        strncpy(info->bitrate, "RF/32", sizeof(info->bitrate));
++        break;
++    case 3:
++        strncpy(info->bitrate, "RF/40", sizeof(info->bitrate));
++        break;
++    case 4:
++        strncpy(info->bitrate, "RF/50", sizeof(info->bitrate));
++        break;
++    case 5:
++        strncpy(info->bitrate, "RF/64", sizeof(info->bitrate));
++        break;
++    case 6:
++        strncpy(info->bitrate, "RF/100", sizeof(info->bitrate));
++        break;
++    case 7:
++        strncpy(info->bitrate, "RF/128", sizeof(info->bitrate));
++        break;
++    }
++
++    info->max_block = (block0 >> 5) & 0x07;
++    info->sequence_term = ((block0 >> 3) & 0x01) != 0;
++    info->pwd_enabled = ((block0 >> 4) & 0x01) != 0;
++    info->aor = ((block0 >> 9) & 0x01) != 0;
++    info->inverted = ((block0 >> 7) & 0x01) != 0;
++    info->fast_write = ((block0 >> 17) & 0x01) != 0;
++}
+diff --git a/pages/t5577_crypto.h b/pages/t5577_crypto.h
+new file mode 100644
+index 0000000..56c5991
+--- /dev/null
++++ b/pages/t5577_crypto.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++uint32_t t5577_white_pwdgen(uint32_t card_id);
++
++void t5577_build_em4100_blocks(const uint8_t uid[5], uint32_t* out_hi, uint32_t* out_lo);
++
++typedef struct {
++    char modulation[16];
++    char bitrate[12];
++    uint8_t max_block;
++    bool pwd_enabled;
++    bool inverted;
++    bool sequence_term;
++    bool fast_write;
++    bool aor;
++} T5577ConfigInfo;
++
++void t5577_parse_config_block0(uint32_t block0, T5577ConfigInfo* info);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/pages/t5577_suite_page.c b/pages/t5577_suite_page.c
+new file mode 100644
+index 0000000..74a6f13
+--- /dev/null
++++ b/pages/t5577_suite_page.c
+@@ -0,0 +1,1015 @@
++#include <furi.h>
++#include <gui/canvas.h>
++#include <gui/elements.h>
++#include <storage/storage.h>
++#include <stdio.h>
++#include <string.h>
++#include "t5577_suite_page.h"
++#include "t5577_crypto.h"
++#include "proxmark5_com.h"
++#include "proxmark5_frame.h"
++#include "pm3_cmd.h"
++
++#define T5577_DICT_DIR   "/ext/apps_data/pm5/dicts"
++#define T5577_DICT_PATH  "/ext/apps_data/pm5/dicts/t5577_pass.txt"
++#define T5577_FOUND_PATH "/ext/apps_data/pm5/dicts/t5577_found.txt"
++#define T5577_DUMP_DIR   "/ext/apps_data/pm5/dumps"
++
++typedef enum {
++    T55ModeEmClone = 0,
++    T55ModeBlockRead = 1,
++    T55ModeBlockWrite = 2,
++    T55ModePwdCrack = 3,
++    T55ModeUnbrick = 4,
++    T55ModeSnoop = 5,
++    T55ModeScope = 6,
++    T55ModeCount = 7,
++} T55Mode;
++
++typedef enum {
++    T55StateIdle,
++    T55StateRunning,
++    T55StateSuccess,
++    T55StateNotFound,
++    T55StateError,
++} T55State;
++
++typedef struct {
++    T55State state;
++    T55Mode mode;
++
++    // EM4100
++    uint8_t em_uid[5];
++    bool has_em_uid;
++
++    // Block Read / Dump
++    uint8_t selected_block;
++    uint32_t block_data[8];
++    bool block_valid[8];
++    char config_desc[48];
++
++    // Block Write
++    uint32_t write_data;
++    uint32_t active_pwd;
++    bool use_pwd;
++    uint8_t downlink_mode; // 0=Fixed, 1=LongLeading, 2=Leading0, 3=1of4
++
++    // Cracker
++    uint8_t crack_method; // 0=White Cloner, 1=Dictionary
++    uint32_t crack_tested;
++    uint32_t crack_total;
++    uint32_t crack_current_key;
++    uint32_t crack_found_key;
++    bool crack_found;
++
++    // Unbrick
++    uint8_t unbrick_preset; // 0=Standard EM4100, 1=Clean All0, 2=Full Wipe
++
++    // Snoop
++    bool snoop_active;
++    uint32_t snoop_pwd;
++    uint8_t snoop_target_blk;
++    bool snoop_found;
++
++    // LF Scope
++    uint16_t scope_samples[64];
++    uint8_t scope_head;
++    uint32_t scope_now_mv;
++    uint32_t scope_peak_mv;
++    bool scope_paused;
++
++    char status_msg[48];
++} T5577SuiteModel;
++
++struct T5577SuitePage {
++    View* view;
++    FuriThread* worker_thread;
++    volatile bool worker_running;
++    volatile bool cancel_requested;
++
++    T5577SuitePageBackCallback back_callback;
++    void* back_callback_context;
++};
++
++static const char* const k_t55_mode_titles[T55ModeCount] = {
++    "1. EM4100 Clone & Build",
++    "2. T5577 Block Read/Dump",
++    "3. Auth Block Write",
++    "4. Password Cracker",
++    "5. Test Mode Unbricker",
++    "6. Reader Snoop (Sniff)",
++    "7. LF Signal Scope",
++};
++
++static const uint32_t k_default_passwords[] = {
++    0x00000000U, // Default / Factory
++    0x12345678U, // Common Generic
++    0x51243648U, // Default Chinese White Cloner
++    0x58494420U, // HID Global 'XID '
++    0x48494450U, // HID Global 'HIDP'
++    0x414D4154U, // Amatek
++    0x494E444CU, // Indala
++    0x43415349U, // Casi-Rusco
++    0x50595241U, // Pyramid
++    0x41574944U, // AWID
++    0x4B455249U, // Keri
++};
++
++static void t5577_ensure_directories_and_dict(void) {
++    Storage* storage = furi_record_open(RECORD_STORAGE);
++    if(!storage) return;
++
++    storage_simply_mkdir(storage, "/ext/apps_data/pm5");
++    storage_simply_mkdir(storage, T5577_DICT_DIR);
++    storage_simply_mkdir(storage, T5577_DUMP_DIR);
++    storage_simply_mkdir(storage, "/ext/lfrfid");
++
++    FileInfo file_info;
++    if(storage_common_stat(storage, T5577_DICT_PATH, &file_info) != FSE_OK ||
++       file_info.size == 0) {
++        File* file = storage_file_alloc(storage);
++        if(file &&
++           storage_file_open(file, T5577_DICT_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++            for(size_t i = 0; i < sizeof(k_default_passwords) / sizeof(k_default_passwords[0]);
++                i++) {
++                char line[16];
++                int len = snprintf(line, sizeof(line), "%08lX\n", (unsigned long)k_default_passwords[i]);
++                storage_file_write(file, line, (uint16_t)len);
++            }
++            storage_file_close(file);
++        }
++        if(file) storage_file_free(file);
++    }
++
++    furi_record_close(RECORD_STORAGE);
++}
++
++static int t55_wait_interruptible(
++    uint16_t cmd,
++    PacketResponseNG* resp,
++    uint32_t timeout_ms,
++    volatile bool* cancel_requested) {
++    uint32_t start = furi_get_tick();
++    while((furi_get_tick() - start) < timeout_ms) {
++        proxmark5_com_keep_fast_poll();
++        if(cancel_requested && *cancel_requested) {
++            return PM3_EOPABORTED;
++        }
++        if(proxmark5_frame_take_by_cmd(cmd, resp)) {
++            return PM3_SUCCESS;
++        }
++        furi_delay_ms(10);
++    }
++    return proxmark5_frame_take_by_cmd(cmd, resp) ? PM3_SUCCESS : PM3_ETIMEOUT;
++}
++
++static uint8_t hex_to_nibble(char c) {
++    if(c >= '0' && c <= '9') return (uint8_t)(c - '0');
++    if(c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
++    if(c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
++    return 0xFF;
++}
++
++static bool parse_em410x_from_log(const char* log_str, uint8_t out_id[5]) {
++    const char* p = strstr(log_str, "EM TAG ID:");
++    if(!p) return false;
++    p += strlen("EM TAG ID:");
++    while(*p == ' ') p++;
++
++    for(int i = 0; i < 5; i++) {
++        uint8_t hi = hex_to_nibble(p[i * 2]);
++        uint8_t lo = hex_to_nibble(p[i * 2 + 1]);
++        if(hi == 0xFF || lo == 0xFF) return false;
++        out_id[i] = (uint8_t)((hi << 4) | lo);
++    }
++    return true;
++}
++
++static void t5577_suite_draw_callback(Canvas* canvas, void* context) {
++    T5577SuiteModel* model = context;
++    if(!model) return;
++
++    canvas_clear(canvas);
++    canvas_set_font(canvas, FontSecondary);
++
++    // Header bar
++    canvas_draw_box(canvas, 0, 0, 128, 11);
++    canvas_set_color(canvas, ColorWhite);
++    canvas_draw_str_aligned(
++        canvas, 64, 9, AlignCenter, AlignBottom, k_t55_mode_titles[model->mode]);
++    canvas_set_color(canvas, ColorBlack);
++
++    char buf[64];
++
++    switch(model->mode) {
++    case T55ModeEmClone: {
++        snprintf(
++            buf,
++            sizeof(buf),
++            "UID: %02X %02X %02X %02X %02X",
++            model->em_uid[0],
++            model->em_uid[1],
++            model->em_uid[2],
++            model->em_uid[3],
++            model->em_uid[4]);
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        uint32_t card_num = ((uint32_t)model->em_uid[3] << 8) | model->em_uid[4];
++        uint32_t cust_id = model->em_uid[1];
++        snprintf(buf, sizeof(buf), "Cust: %lu  Card: %05lu", (unsigned long)cust_id, (unsigned long)card_num);
++        canvas_draw_str(canvas, 2, 34, buf);
++
++        canvas_draw_str(canvas, 2, 45, model->status_msg);
++
++        // Actions
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Clone to T5577  R:Save SD");
++        break;
++    }
++    case T55ModeBlockRead: {
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Block [%u]: %08lX %s",
++            model->selected_block,
++            (unsigned long)model->block_data[model->selected_block],
++            model->block_valid[model->selected_block] ? "[OK]" : "[--]");
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        if(model->block_valid[0]) {
++            snprintf(buf, sizeof(buf), "Cfg: %s", model->config_desc);
++            canvas_draw_str(canvas, 2, 34, buf);
++        } else {
++            canvas_draw_str(canvas, 2, 34, "Cfg: (Read Blk 0 to decode)");
++        }
++
++        canvas_draw_str(canvas, 2, 45, model->status_msg);
++
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Read Blk  R:Dump All");
++        break;
++    }
++    case T55ModeBlockWrite: {
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Blk [%u]: %08lX (r%u)",
++            model->selected_block,
++            (unsigned long)model->write_data,
++            model->downlink_mode);
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Pwd: %08lX  Mode: %s",
++            (unsigned long)model->active_pwd,
++            model->use_pwd ? "AUTH" : "PLAIN");
++        canvas_draw_str(canvas, 2, 34, buf);
++
++        canvas_draw_str(canvas, 2, 45, model->status_msg);
++
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Write  R:Toggle Pwd");
++        break;
++    }
++    case T55ModePwdCrack: {
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Method: %s",
++            model->crack_method == 0 ? "White Cloner Algo" : "Dictionary Stream");
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        if(model->crack_method == 1 && model->crack_total > 0) {
++            elements_progress_bar(
++                canvas,
++                2,
++                26,
++                124,
++                (float)model->crack_tested / (float)model->crack_total);
++            snprintf(
++                buf,
++                sizeof(buf),
++                "Key: %lu/%lu [%08lX]",
++                (unsigned long)model->crack_tested,
++                (unsigned long)model->crack_total,
++                (unsigned long)model->crack_current_key);
++            canvas_draw_str(canvas, 2, 43, buf);
++        } else {
++            snprintf(
++                buf,
++                sizeof(buf),
++                "Found Key: %08lX %s",
++                (unsigned long)model->crack_found_key,
++                model->crack_found ? "[CRACKED!]" : "[NONE]");
++            canvas_draw_str(canvas, 2, 35, buf);
++            canvas_draw_str(canvas, 2, 46, model->status_msg);
++        }
++
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Crack  R:Switch Method");
++        break;
++    }
++    case T55ModeUnbrick: {
++        const char* const presets[] = {"Standard EM4100", "Clean All-Zeros", "Full Tag Wipe"};
++        snprintf(buf, sizeof(buf), "Preset: %s", presets[model->unbrick_preset]);
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        canvas_draw_str(canvas, 2, 34, "Fires Atmel 5184us pulses (r0..r3)");
++        canvas_draw_str(canvas, 2, 45, model->status_msg);
++
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Unbrick Tag  R:Preset");
++        break;
++    }
++    case T55ModeSnoop: {
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Snoop: %s",
++            model->snoop_active ? "LISTENING FIELD..." : "IDLE");
++        canvas_draw_str(canvas, 2, 23, buf);
++
++        snprintf(
++            buf,
++            sizeof(buf),
++            "Harvested: %08lX %s",
++            (unsigned long)model->snoop_pwd,
++            model->snoop_found ? "[CAPTURED!]" : "[--]");
++        canvas_draw_str(canvas, 2, 34, buf);
++
++        canvas_draw_str(canvas, 2, 45, model->status_msg);
++
++        canvas_draw_line(canvas, 0, 52, 128, 52);
++        canvas_draw_str(canvas, 2, 62, "OK:Start/Stop  R:Save Key");
++        break;
++    }
++    case T55ModeScope: {
++        // Draw 64-sample waveform
++        uint32_t max_v = model->scope_peak_mv > 0 ? model->scope_peak_mv : 50000;
++        int prev_x = 0;
++        int prev_y = 50;
++        for(int i = 0; i < 64; i++) {
++            int idx = (model->scope_head + i) % 64;
++            uint16_t val = model->scope_samples[idx];
++            int y = 50 - (int)((uint32_t)val * 34 / max_v);
++            if(y < 14) y = 14;
++            if(y > 50) y = 50;
++            int x = i * 2;
++            if(i > 0) {
++                canvas_draw_line(canvas, prev_x, prev_y, x, y);
++            }
++            prev_x = x;
++            prev_y = y;
++        }
++
++        float v_now = (float)model->scope_now_mv / 1000.0f;
++        float v_peak = (float)model->scope_peak_mv / 1000.0f;
++        uint32_t drop =
++            (model->scope_peak_mv > model->scope_now_mv && model->scope_peak_mv > 0) ?
++                ((model->scope_peak_mv - model->scope_now_mv) * 100 / model->scope_peak_mv) :
++                0;
++        snprintf(buf, sizeof(buf), "Now:%.2fV Pk:%.2fV -%lu%%", (double)v_now, (double)v_peak, (unsigned long)drop);
++        canvas_draw_str(canvas, 2, 62, buf);
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++static void t5577_suite_start_worker(T5577SuitePage* page);
++static void t5577_suite_stop_worker(T5577SuitePage* page);
++
++static bool t5577_suite_input_callback(InputEvent* event, void* context) {
++    T5577SuitePage* page = context;
++    if(!page) return false;
++
++    if(event->type == InputTypeShort && event->key == InputKeyBack) {
++        t5577_suite_stop_worker(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyLeft) {
++        t5577_suite_stop_worker(page);
++        if(page->back_callback) {
++            page->back_callback(page->back_callback_context);
++        }
++        return true;
++    }
++
++    if((event->type == InputTypeShort || event->type == InputTypeRepeat) &&
++       (event->key == InputKeyUp || event->key == InputKeyDown)) {
++        if(!page->worker_running) {
++            T5577SuiteModel* model = view_get_model(page->view);
++            if(event->key == InputKeyUp) {
++                model->mode =
++                    (model->mode == 0) ? (T55Mode)(T55ModeCount - 1) : (T55Mode)(model->mode - 1);
++            } else {
++                model->mode = (T55Mode)((model->mode + 1) % T55ModeCount);
++            }
++            view_commit_model(page->view, true);
++            return true;
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyOk) {
++        if(!page->worker_running) {
++            t5577_suite_start_worker(page);
++            return true;
++        } else {
++            T5577SuiteModel* model = view_get_model(page->view);
++            if(model->mode == T55ModeScope) {
++                model->scope_paused = !model->scope_paused;
++                view_commit_model(page->view, true);
++                return true;
++            } else if(model->mode == T55ModeSnoop) {
++                page->cancel_requested = true;
++                view_commit_model(page->view, false);
++                return true;
++            }
++            view_commit_model(page->view, false);
++        }
++    }
++
++    if(event->type == InputTypeShort && event->key == InputKeyRight) {
++        T5577SuiteModel* model = view_get_model(page->view);
++        if(!page->worker_running) {
++            switch(model->mode) {
++            case T55ModeEmClone: {
++                // Save .rfid file
++                Storage* storage = furi_record_open(RECORD_STORAGE);
++                if(storage) {
++                    char path[64];
++                    snprintf(
++                        path,
++                        sizeof(path),
++                        "/ext/lfrfid/PM5_EM_%02X%02X%02X%02X%02X.rfid",
++                        model->em_uid[0],
++                        model->em_uid[1],
++                        model->em_uid[2],
++                        model->em_uid[3],
++                        model->em_uid[4]);
++                    File* file = storage_file_alloc(storage);
++                    if(file && storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
++                        char content[160];
++                        snprintf(
++                            content,
++                            sizeof(content),
++                            "Filetype: Flipper RFID key\nVersion: 1\nKey type: EM4100\nData: %02X %02X %02X %02X %02X\n",
++                            model->em_uid[0],
++                            model->em_uid[1],
++                            model->em_uid[2],
++                            model->em_uid[3],
++                            model->em_uid[4]);
++                        storage_file_write(file, content, (uint16_t)strlen(content));
++                        storage_file_close(file);
++                        snprintf(model->status_msg, sizeof(model->status_msg), "Saved to /ext/lfrfid!");
++                    }
++                    if(file) storage_file_free(file);
++                    furi_record_close(RECORD_STORAGE);
++                }
++                break;
++            }
++            case T55ModeBlockRead: {
++                // Cycle block 0..7
++                model->selected_block = (model->selected_block + 1) % 8;
++                break;
++            }
++            case T55ModeBlockWrite: {
++                // Toggle auth mode
++                model->use_pwd = !model->use_pwd;
++                snprintf(
++                    model->status_msg,
++                    sizeof(model->status_msg),
++                    model->use_pwd ? "Auth Mode ON (Pwd used)" : "Plain Mode (No pwd)");
++                break;
++            }
++            case T55ModePwdCrack: {
++                // Switch method
++                model->crack_method = (model->crack_method + 1) % 2;
++                break;
++            }
++            case T55ModeUnbrick: {
++                // Cycle presets
++                model->unbrick_preset = (model->unbrick_preset + 1) % 3;
++                break;
++            }
++            case T55ModeSnoop: {
++                // Save found key
++                if(model->snoop_found) {
++                    Storage* storage = furi_record_open(RECORD_STORAGE);
++                    if(storage) {
++                        File* file = storage_file_alloc(storage);
++                        if(file && storage_file_open(file, T5577_DICT_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
++                            char line[32];
++                            int len = snprintf(line, sizeof(line), "%08lX\n", (unsigned long)model->snoop_pwd);
++                            storage_file_write(file, line, (uint16_t)len);
++                            storage_file_close(file);
++                            snprintf(model->status_msg, sizeof(model->status_msg), "Saved to t5577_pass.txt!");
++                        }
++                        if(file) storage_file_free(file);
++                        furi_record_close(RECORD_STORAGE);
++                    }
++                }
++                break;
++            }
++            case T55ModeScope: {
++                model->scope_peak_mv = model->scope_now_mv;
++                break;
++            }
++            default:
++                break;
++            }
++            view_commit_model(page->view, true);
++            return true;
++        }
++        view_commit_model(page->view, false);
++    }
++
++    return false;
++}
++
++static int32_t t5577_suite_worker(void* context) {
++    T5577SuitePage* page = context;
++    if(!page) return 0;
++
++    PacketResponseNG* resp = malloc(sizeof(PacketResponseNG));
++    if(!resp) {
++        page->worker_running = false;
++        return 0;
++    }
++
++    T5577SuiteModel* model = view_get_model(page->view);
++    T55Mode mode = model->mode;
++    uint8_t em_uid[5];
++    memcpy(em_uid, model->em_uid, 5);
++    uint8_t sel_block = model->selected_block;
++    uint32_t write_data = model->write_data;
++    uint32_t active_pwd = model->active_pwd;
++    bool use_pwd = model->use_pwd;
++    uint8_t downlink_mode = model->downlink_mode;
++    uint8_t crack_method = model->crack_method;
++    uint8_t unbrick_preset = model->unbrick_preset;
++    view_commit_model(page->view, false);
++
++    switch(mode) {
++    case T55ModeEmClone: {
++        if(!model->has_em_uid) {
++            clearCommandBuffer();
++            SendCommandNG(CMD_LF_EM410X_WATCH, NULL, 0);
++            uint32_t start = furi_get_tick();
++            bool break_armed = false;
++            char log[140];
++            bool found = false;
++            while((furi_get_tick() - start) < 3000 && !page->cancel_requested) {
++                proxmark5_com_keep_fast_poll();
++                if(!break_armed && (furi_get_tick() - start) >= 250) {
++                    proxmark5_com_set_break_loop(true);
++                    break_armed = true;
++                }
++                if(proxmark5_frame_pop_log(log, sizeof(log))) {
++                    if(parse_em410x_from_log(log, em_uid)) {
++                        found = true;
++                        break;
++                    }
++                }
++                furi_delay_ms(15);
++            }
++            model = view_get_model(page->view);
++            if(found) {
++                memcpy(model->em_uid, em_uid, 5);
++                model->has_em_uid = true;
++                model->state = T55StateSuccess;
++                snprintf(model->status_msg, sizeof(model->status_msg), "EM4100 Tag Scanned!");
++            } else {
++                model->state = T55StateNotFound;
++                snprintf(model->status_msg, sizeof(model->status_msg), "No EM4100 tag detected");
++            }
++            view_commit_model(page->view, true);
++            break;
++        }
++
++        // Clone to T5577
++        struct {
++            bool Q5;
++            bool EM;
++            bool add_electra;
++            uint8_t clock;
++            uint32_t high;
++            uint32_t low;
++        } PACKED payload = {
++            .Q5 = false,
++            .EM = false,
++            .add_electra = false,
++            .clock = 64,
++            .high = (uint32_t)em_uid[0],
++            .low = ((uint32_t)em_uid[1] << 24) | ((uint32_t)em_uid[2] << 16) |
++                   ((uint32_t)em_uid[3] << 8) | (uint32_t)em_uid[4],
++        };
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_EM410X_CLONE, (uint8_t*)&payload, sizeof(payload));
++        int rc = t55_wait_interruptible(CMD_LF_EM410X_CLONE, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            model->state = T55StateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Cloned EM410x to T5577 OK!");
++            FURI_LOG_I("PM5_T55", "EM4100 cloned successfully");
++        } else {
++            model->state = T55StateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Clone failed rc=%d", rc);
++        }
++        view_commit_model(page->view, true);
++        break;
++    }
++    case T55ModeBlockRead: {
++        // Read block via CMD_LF_T55XX_READBL
++        struct {
++            uint32_t password;
++            uint8_t blockno;
++            uint8_t page;
++            bool pwdmode;
++            uint8_t downlink_mode;
++        } PACKED read_req = {
++            .password = active_pwd,
++            .blockno = sel_block,
++            .page = 0,
++            .pwdmode = use_pwd,
++            .downlink_mode = downlink_mode,
++        };
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_T55XX_READBL, (uint8_t*)&read_req, sizeof(read_req));
++        int rc = t55_wait_interruptible(CMD_LF_T55XX_READBL, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            if(resp->length >= 4) {
++                uint32_t val = (uint32_t)resp->data.asBytes[0] |
++                               ((uint32_t)resp->data.asBytes[1] << 8) |
++                               ((uint32_t)resp->data.asBytes[2] << 16) |
++                               ((uint32_t)resp->data.asBytes[3] << 24);
++                model->block_data[sel_block] = val;
++                model->block_valid[sel_block] = true;
++                if(sel_block == 0) {
++                    T5577ConfigInfo cfg;
++                    t5577_parse_config_block0(val, &cfg);
++                    snprintf(
++                        model->config_desc,
++                        sizeof(model->config_desc),
++                        "%.16s %.12s M:%u",
++                        cfg.modulation,
++                        cfg.bitrate,
++                        (unsigned int)cfg.max_block);
++                }
++                snprintf(model->status_msg, sizeof(model->status_msg), "Block %u read OK!", sel_block);
++            } else {
++                snprintf(model->status_msg, sizeof(model->status_msg), "Blk %u: Signal acquired in buf", sel_block);
++            }
++            model->state = T55StateSuccess;
++        } else {
++            model->state = T55StateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Read Blk %u failed", sel_block);
++        }
++        view_commit_model(page->view, true);
++        break;
++    }
++    case T55ModeBlockWrite: {
++        t55xx_write_block_t wbl = {
++            .data = write_data,
++            .pwd = active_pwd,
++            .blockno = sel_block,
++            .flags = (uint16_t)((use_pwd ? 0x01 : 0x00) | ((downlink_mode & 3) << 3)),
++        };
++
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_T55XX_WRITEBL, (uint8_t*)&wbl, sizeof(wbl));
++        int rc = t55_wait_interruptible(CMD_LF_T55XX_WRITEBL, resp, 2500, &page->cancel_requested);
++
++        model = view_get_model(page->view);
++        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++            model->state = T55StateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Wrote Blk %u OK!", sel_block);
++        } else {
++            model->state = T55StateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Write Blk %u failed", sel_block);
++        }
++        view_commit_model(page->view, true);
++        break;
++    }
++    case T55ModePwdCrack: {
++        if(crack_method == 0) {
++            // White Cloner algorithm derived from lower 32-bit ID
++            uint32_t lower_id = ((uint32_t)em_uid[1] << 24) | ((uint32_t)em_uid[2] << 16) |
++                                ((uint32_t)em_uid[3] << 8) | (uint32_t)em_uid[4];
++            uint32_t cand = t5577_white_pwdgen(lower_id);
++
++            // Test candidate
++            struct {
++                uint32_t password;
++                uint8_t blockno;
++                uint8_t page;
++                bool pwdmode;
++                uint8_t downlink_mode;
++            } PACKED read_req = {
++                .password = cand,
++                .blockno = 0,
++                .page = 0,
++                .pwdmode = true,
++                .downlink_mode = 0,
++            };
++            clearCommandBuffer();
++            SendCommandNG(CMD_LF_T55XX_READBL, (uint8_t*)&read_req, sizeof(read_req));
++            int rc = t55_wait_interruptible(CMD_LF_T55XX_READBL, resp, 1500, &page->cancel_requested);
++
++            model = view_get_model(page->view);
++            model->crack_found_key = cand;
++            model->crack_found = (rc == PM3_SUCCESS && resp->status == PM3_SUCCESS);
++            if(model->crack_found) {
++                model->active_pwd = cand;
++                model->use_pwd = true;
++                model->state = T55StateSuccess;
++                snprintf(model->status_msg, sizeof(model->status_msg), "White Cloner Key: %08lX!", (unsigned long)cand);
++            } else {
++                model->state = T55StateNotFound;
++                snprintf(model->status_msg, sizeof(model->status_msg), "Candidate %08lX no match", (unsigned long)cand);
++            }
++            view_commit_model(page->view, true);
++        } else {
++            // Dictionary Attack
++            Storage* storage = furi_record_open(RECORD_STORAGE);
++            if(storage) {
++                File* file = storage_file_alloc(storage);
++                if(file && storage_file_open(file, T5577_DICT_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
++                    uint32_t count = 0;
++                    bool hit = false;
++                    uint32_t hit_key = 0;
++
++                    model = view_get_model(page->view);
++                    model->crack_total = sizeof(k_default_passwords) / sizeof(k_default_passwords[0]);
++                    model->crack_tested = 0;
++                    view_commit_model(page->view, true);
++
++                    for(size_t i = 0; i < sizeof(k_default_passwords) / sizeof(k_default_passwords[0]); i++) {
++                        if(page->cancel_requested) break;
++
++                        uint32_t test_pwd = k_default_passwords[i];
++                        count++;
++
++                        model = view_get_model(page->view);
++                        model->crack_tested = count;
++                        model->crack_current_key = test_pwd;
++                        view_commit_model(page->view, true);
++
++                        struct {
++                            uint32_t password;
++                            uint8_t blockno;
++                            uint8_t page;
++                            bool pwdmode;
++                            uint8_t downlink_mode;
++                        } PACKED read_req = {
++                            .password = test_pwd,
++                            .blockno = 0,
++                            .page = 0,
++                            .pwdmode = true,
++                            .downlink_mode = 0,
++                        };
++                        clearCommandBuffer();
++                        SendCommandNG(CMD_LF_T55XX_READBL, (uint8_t*)&read_req, sizeof(read_req));
++                        int rc = t55_wait_interruptible(CMD_LF_T55XX_READBL, resp, 800, &page->cancel_requested);
++                        if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS && resp->length >= 4) {
++                            hit = true;
++                            hit_key = test_pwd;
++                            break;
++                        }
++                        furi_delay_ms(15);
++                    }
++                    storage_file_close(file);
++
++                    model = view_get_model(page->view);
++                    if(hit) {
++                        model->crack_found = true;
++                        model->crack_found_key = hit_key;
++                        model->active_pwd = hit_key;
++                        model->use_pwd = true;
++                        model->state = T55StateSuccess;
++                        snprintf(model->status_msg, sizeof(model->status_msg), "Cracked! Key: %08lX", (unsigned long)hit_key);
++                    } else {
++                        model->state = T55StateNotFound;
++                        snprintf(model->status_msg, sizeof(model->status_msg), "No match in dictionary");
++                    }
++                    view_commit_model(page->view, true);
++                }
++                if(file) storage_file_free(file);
++                furi_record_close(RECORD_STORAGE);
++            }
++        }
++        break;
++    }
++    case T55ModeUnbrick: {
++        uint32_t target_b0 = 0x00148040U; // EM4100 default
++        if(unbrick_preset == 1) target_b0 = 0x00000000U; // All0
++        if(unbrick_preset == 2) target_b0 = 0x00148040U; // Wipe resets to EM4100
++
++        bool recovered = false;
++        // Cycle 4 reset rates (r0=0, r1=1, r2=2, r3=3) with test-mode timing (flags |= 0x04)
++        for(uint8_t rate = 0; rate < 4 && !page->cancel_requested; rate++) {
++            t55xx_write_block_t wbl = {
++                .data = target_b0,
++                .pwd = 0,
++                .blockno = 0,
++                .flags = (uint16_t)(0x04 | (rate << 3)), // 0x04 = testMode
++            };
++            clearCommandBuffer();
++            SendCommandNG(CMD_LF_T55XX_WRITEBL, (uint8_t*)&wbl, sizeof(wbl));
++            int rc = t55_wait_interruptible(CMD_LF_T55XX_WRITEBL, resp, 1200, &page->cancel_requested);
++            if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS) {
++                recovered = true;
++                break;
++            }
++            furi_delay_ms(50);
++        }
++
++        model = view_get_model(page->view);
++        if(recovered) {
++            model->state = T55StateSuccess;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Unbrick SUCCESS! Blk0 restored");
++        } else {
++            model->state = T55StateError;
++            snprintf(model->status_msg, sizeof(model->status_msg), "Unbrick pulses failed");
++        }
++        view_commit_model(page->view, true);
++        break;
++    }
++    case T55ModeSnoop: {
++        model = view_get_model(page->view);
++        model->snoop_active = true;
++        model->state = T55StateRunning;
++        snprintf(model->status_msg, sizeof(model->status_msg), "Listening for reader gaps...");
++        view_commit_model(page->view, true);
++
++        // Run CMD_LF_SNIFF_RAW_ADC
++        struct {
++            uint16_t samples;
++            uint16_t trigger_threshold;
++        } PACKED sniff_req = {
++            .samples = 4000,
++            .trigger_threshold = 20,
++        };
++        clearCommandBuffer();
++        SendCommandNG(CMD_LF_SNIFF_RAW_ADC, (uint8_t*)&sniff_req, sizeof(sniff_req));
++
++        uint32_t snoop_start = furi_get_tick();
++        while((furi_get_tick() - snoop_start) < 4000 && !page->cancel_requested) {
++            proxmark5_com_keep_fast_poll();
++            char log[120];
++            if(proxmark5_frame_pop_log(log, sizeof(log))) {
++                const char* p = strstr(log, "password");
++                if(p) {
++                    // Extract hex password
++                    unsigned long pwd = 0;
++                    if(sscanf(p, "password %lx", &pwd) == 1) {
++                        model = view_get_model(page->view);
++                        model->snoop_pwd = (uint32_t)pwd;
++                        model->snoop_found = true;
++                        view_commit_model(page->view, true);
++                        break;
++                    }
++                }
++            }
++            furi_delay_ms(20);
++        }
++
++        model = view_get_model(page->view);
++        model->snoop_active = false;
++        model->state = model->snoop_found ? T55StateSuccess : T55StateNotFound;
++        snprintf(
++            model->status_msg,
++            sizeof(model->status_msg),
++            model->snoop_found ? "Password Harvested!" : "Sniff timeout (No reader)");
++        view_commit_model(page->view, true);
++        break;
++    }
++    case T55ModeScope: {
++        model = view_get_model(page->view);
++        model->state = T55StateRunning;
++        view_commit_model(page->view, false);
++
++        while(!page->cancel_requested) {
++            model = view_get_model(page->view);
++            bool paused = model->scope_paused;
++            view_commit_model(page->view, false);
++
++            if(!paused) {
++                clearCommandBuffer();
++                SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_LF, NULL, 0);
++                int rc = t55_wait_interruptible(CMD_MEASURE_ANTENNA_TUNING_LF, resp, 250, &page->cancel_requested);
++                if(rc == PM3_SUCCESS && resp->status == PM3_SUCCESS && resp->length >= 4) {
++                    uint32_t mv = (uint32_t)resp->data.asBytes[0] |
++                                  ((uint32_t)resp->data.asBytes[1] << 8) |
++                                  ((uint32_t)resp->data.asBytes[2] << 16) |
++                                  ((uint32_t)resp->data.asBytes[3] << 24);
++
++                    model = view_get_model(page->view);
++                    model->scope_now_mv = mv;
++                    if(mv > model->scope_peak_mv) model->scope_peak_mv = mv;
++                    model->scope_samples[model->scope_head] = (uint16_t)(mv > 65535 ? 65535 : mv);
++                    model->scope_head = (model->scope_head + 1) % 64;
++                    view_commit_model(page->view, true);
++                }
++            }
++            furi_delay_ms(60);
++        }
++        break;
++    }
++    default:
++        break;
++    }
++
++    free(resp);
++    page->worker_running = false;
++    return 0;
++}
++
++static void t5577_suite_start_worker(T5577SuitePage* page) {
++    if(!page || page->worker_running) return;
++
++    t5577_ensure_directories_and_dict();
++
++    T5577SuiteModel* model = view_get_model(page->view);
++    model->state = T55StateRunning;
++    snprintf(model->status_msg, sizeof(model->status_msg), "Executing...");
++    view_commit_model(page->view, true);
++
++    page->cancel_requested = false;
++    page->worker_running = true;
++    page->worker_thread = furi_thread_alloc_ex(
++        "T5577SuiteWorker", 3072, t5577_suite_worker, page);
++    furi_thread_start(page->worker_thread);
++}
++
++static void t5577_suite_stop_worker(T5577SuitePage* page) {
++    if(!page || !page->worker_thread) return;
++
++    page->cancel_requested = true;
++    furi_thread_join(page->worker_thread);
++    furi_thread_free(page->worker_thread);
++    page->worker_thread = NULL;
++    page->worker_running = false;
++}
++
++T5577SuitePage* t5577_suite_page_create(
++    T5577SuitePageBackCallback back_callback,
++    void* back_callback_context) {
++    T5577SuitePage* page = calloc(1, sizeof(T5577SuitePage));
++    if(!page) return NULL;
++
++    page->view = view_alloc();
++    if(!page->view) {
++        free(page);
++        return NULL;
++    }
++
++    page->back_callback = back_callback;
++    page->back_callback_context = back_callback_context;
++
++    view_set_context(page->view, page);
++    view_allocate_model(page->view, ViewModelTypeLocking, sizeof(T5577SuiteModel));
++    view_set_draw_callback(page->view, t5577_suite_draw_callback);
++    view_set_input_callback(page->view, t5577_suite_input_callback);
++
++    T5577SuiteModel* model = view_get_model(page->view);
++    memset(model, 0, sizeof(*model));
++    model->state = T55StateIdle;
++    model->mode = T55ModeEmClone;
++
++    // Default EM4100 test UID
++    const uint8_t def_em[5] = {0x0F, 0x03, 0x68, 0x56, 0x8B};
++    memcpy(model->em_uid, def_em, 5);
++    model->has_em_uid = true;
++    model->write_data = 0x00148040U;
++    model->active_pwd = 0x00000000U;
++    snprintf(model->status_msg, sizeof(model->status_msg), "Ready");
++    view_commit_model(page->view, false);
++
++    return page;
++}
++
++void t5577_suite_page_destroy(T5577SuitePage* page) {
++    if(!page) return;
++    t5577_suite_stop_worker(page);
++    if(page->view) {
++        view_free(page->view);
++    }
++    free(page);
++}
++
++View* t5577_suite_page_get_view(T5577SuitePage* page) {
++    return page ? page->view : NULL;
++}
+diff --git a/pages/t5577_suite_page.h b/pages/t5577_suite_page.h
+new file mode 100644
+index 0000000..9d44f74
+--- /dev/null
++++ b/pages/t5577_suite_page.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <gui/view.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct T5577SuitePage T5577SuitePage;
++typedef void (*T5577SuitePageBackCallback)(void* context);
++
++T5577SuitePage* t5577_suite_page_create(
++    T5577SuitePageBackCallback back_callback,
++    void* back_callback_context);
++
++void t5577_suite_page_destroy(T5577SuitePage* page);
++
++View* t5577_suite_page_get_view(T5577SuitePage* page);
++
++#ifdef __cplusplus
++}
++#endif
+-- 
+2.56.0
+
