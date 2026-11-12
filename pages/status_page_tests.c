@@ -1,6 +1,7 @@
 #include <furi.h>
 #include <string.h>
 #include "status_page_tests.h"
+#include "proxmark5_com.h"
 #include "proxmark5_frame.h"
 #include "pm3_cmd.h"
 
@@ -43,7 +44,10 @@ static int status_test_send_and_wait(
     PacketResponseNG* resp,
     uint32_t timeout_ms,
     volatile bool* cancel_requested) {
-    for(int attempt = 0; attempt < 2; attempt++) {
+    for(int attempt = 0; attempt < 3; attempt++) {
+        if(attempt > 0) {
+            proxmark5_com_handshake();
+        }
         clearCommandBuffer();
         if(cancel_requested && *cancel_requested) {
             return PM3_EOPABORTED;
@@ -54,6 +58,7 @@ static int status_test_send_and_wait(
         if(result != PM3_ETIMEOUT) {
             return result;
         }
+        furi_delay_ms(15);
     }
     return PM3_ETIMEOUT;
 }

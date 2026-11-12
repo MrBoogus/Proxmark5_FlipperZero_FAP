@@ -4,11 +4,6 @@
 #include "fmps_cxt.h"
 #include "proxmark5_com.h"
 
-// For GUI:
-//  https://github.com/jamisonderek/flipper-zero-tutorials/wiki/User-Interface#viewdisptacher
-//  https://brodan.biz/blog/a-visual-guide-to-flipper-zero-gui-components/
-
-// The callback for the back event, it will stop the view dispatcher which will exit the app
 static bool fmps_cxt_back_event_callback(void* context) {
     Proxmark5App* app = context;
     view_dispatcher_stop(app->view_dispatcher);
@@ -32,6 +27,51 @@ static void fmps_cxt_open_read_hf14a_page(void* context) {
         app->view_dispatcher, Proxmark5CustomEventOpenReadHf14aPage);
 }
 
+static void fmps_cxt_open_hf_mf_audit_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, Proxmark5CustomEventOpenHfMfAuditPage);
+}
+
+static void fmps_cxt_open_hf_sniff_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenHfSniffPage);
+}
+
+static void fmps_cxt_open_read_hf_multi_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, Proxmark5CustomEventOpenReadHfMultiPage);
+}
+
+static void fmps_cxt_open_lf_lab_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenLfLabPage);
+}
+
+static void fmps_cxt_open_t5577_suite_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, Proxmark5CustomEventOpenT5577SuitePage);
+}
+
+static void fmps_cxt_open_rf_scope_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenRfScopePage);
+}
+
+static void fmps_cxt_open_antenna_tune_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, Proxmark5CustomEventOpenAntennaTunePage);
+}
+
+static void fmps_cxt_open_pm5_control_page(void* context) {
+    Proxmark5App* app = context;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, Proxmark5CustomEventOpenPm5ControlPage);
+}
+
 static void fmps_cxt_open_status_page(void* context) {
     Proxmark5App* app = context;
     view_dispatcher_send_custom_event(app->view_dispatcher, Proxmark5CustomEventOpenStatusPage);
@@ -52,6 +92,37 @@ static bool fmps_cxt_custom_event_callback(void* context, uint32_t event) {
         view_dispatcher_switch_to_view(app->view_dispatcher, ReadHf14aPageViewId);
         read_hf14a_page_start(app->read_hf14a_page);
         return true;
+    case Proxmark5CustomEventOpenHfMfAuditPage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, HfMfAuditPageViewId);
+        hf_mf_audit_page_start(app->hf_mf_audit_page);
+        return true;
+    case Proxmark5CustomEventOpenHfSniffPage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, HfSniffPageViewId);
+        hf_sniff_page_start(app->hf_sniff_page);
+        return true;
+    case Proxmark5CustomEventOpenReadHfMultiPage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, ReadHfMultiPageViewId);
+        read_hf_multi_page_start(app->read_hf_multi_page);
+        return true;
+    case Proxmark5CustomEventOpenLfLabPage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, LfLabPageViewId);
+        lf_lab_page_start(app->lf_lab_page);
+        return true;
+    case Proxmark5CustomEventOpenT5577SuitePage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, T5577SuitePageViewId);
+        return true;
+    case Proxmark5CustomEventOpenRfScopePage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, RfScopePageViewId);
+        rf_scope_page_start(app->rf_scope_page);
+        return true;
+    case Proxmark5CustomEventOpenAntennaTunePage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, AntennaTunePageViewId);
+        antenna_tune_page_start(app->antenna_tune_page);
+        return true;
+    case Proxmark5CustomEventOpenPm5ControlPage:
+        view_dispatcher_switch_to_view(app->view_dispatcher, Pm5ControlPageViewId);
+        pm5_control_page_start(app->pm5_control_page);
+        return true;
     case Proxmark5CustomEventOpenStatusPage:
         view_dispatcher_switch_to_view(app->view_dispatcher, StatusPageViewId);
         status_page_start(app->status_page);
@@ -66,17 +137,62 @@ static uint32_t operate_page_previous_callback(void* context) {
     return MainPageViewId;
 }
 
-// Context is the view's context, which is the page itself (set in read_hitag2_page_create).
 static uint32_t read_hitag2_page_previous_callback(void* context) {
     ReadHitag2Page* read_hitag2_page = context;
     read_hitag2_page_stop(read_hitag2_page);
     return OperatePageViewId;
 }
 
-// Context is the view's context, which is the page itself (set in read_hf14a_page_create).
 static uint32_t read_hf14a_page_previous_callback(void* context) {
     ReadHf14aPage* read_hf14a_page = context;
     read_hf14a_page_stop(read_hf14a_page);
+    return OperatePageViewId;
+}
+
+static uint32_t hf_mf_audit_page_previous_callback(void* context) {
+    HfMfAuditPage* page = context;
+    hf_mf_audit_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t hf_sniff_page_previous_callback(void* context) {
+    HfSniffPage* page = context;
+    hf_sniff_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t read_hf_multi_page_previous_callback(void* context) {
+    ReadHfMultiPage* page = context;
+    read_hf_multi_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t lf_lab_page_previous_callback(void* context) {
+    LfLabPage* page = context;
+    lf_lab_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t t5577_suite_page_previous_callback(void* context) {
+    UNUSED(context);
+    return OperatePageViewId;
+}
+
+static uint32_t rf_scope_page_previous_callback(void* context) {
+    RfScopePage* page = context;
+    rf_scope_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t antenna_tune_page_previous_callback(void* context) {
+    AntennaTunePage* page = context;
+    antenna_tune_page_stop(page);
+    return OperatePageViewId;
+}
+
+static uint32_t pm5_control_page_previous_callback(void* context) {
+    Pm5ControlPage* page = context;
+    pm5_control_page_stop(page);
     return OperatePageViewId;
 }
 
@@ -90,20 +206,32 @@ Proxmark5App* proxmark5_app_alloc() {
     Proxmark5App* app = calloc(1, sizeof(Proxmark5App));
     app->gui = furi_record_open(RECORD_GUI);
 
-    // Allocate the view dispatcher and attach it to the GUI
     app->view_dispatcher = view_dispatcher_alloc();
-    // Attach the view dispatcher to the GUI with fullscreen type
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
-    // Create and add the main page view to the view dispatcher
     app->main_page = main_page_create(fmps_cxt_open_operate_page, app);
     view_dispatcher_add_view(app->view_dispatcher, MainPageViewId, app->main_page->canvas_view);
 
-    // Create and add the operate submenu page to the view dispatcher
     app->operate_page = operate_page_create(
         fmps_cxt_open_read_hitag2_page,
         app,
         fmps_cxt_open_read_hf14a_page,
+        app,
+        fmps_cxt_open_hf_mf_audit_page,
+        app,
+        fmps_cxt_open_hf_sniff_page,
+        app,
+        fmps_cxt_open_read_hf_multi_page,
+        app,
+        fmps_cxt_open_lf_lab_page,
+        app,
+        fmps_cxt_open_t5577_suite_page,
+        app,
+        fmps_cxt_open_rf_scope_page,
+        app,
+        fmps_cxt_open_antenna_tune_page,
+        app,
+        fmps_cxt_open_pm5_control_page,
         app,
         fmps_cxt_open_status_page,
         app);
@@ -112,9 +240,6 @@ Proxmark5App* proxmark5_app_alloc() {
     view_dispatcher_add_view(
         app->view_dispatcher, OperatePageViewId, submenu_get_view(app->operate_page->submenu));
 
-    // Create and add ReadHitag2 page to the view dispatcher
-    // The left "Back" button returns to the functions menu, same destination as the
-    // hardware back button below.
     app->read_hitag2_page = read_hitag2_page_create(fmps_cxt_open_operate_page, app);
     view_set_previous_callback(
         read_hitag2_page_get_view(app->read_hitag2_page), read_hitag2_page_previous_callback);
@@ -123,8 +248,6 @@ Proxmark5App* proxmark5_app_alloc() {
         ReadHitag2PageViewId,
         read_hitag2_page_get_view(app->read_hitag2_page));
 
-    // Create and add HF 14a Reader page to the view dispatcher - same Back
-    // button/destination convention as ReadHitag2 above.
     app->read_hf14a_page = read_hf14a_page_create(fmps_cxt_open_operate_page, app);
     view_set_previous_callback(
         read_hf14a_page_get_view(app->read_hf14a_page), read_hf14a_page_previous_callback);
@@ -133,14 +256,77 @@ Proxmark5App* proxmark5_app_alloc() {
         ReadHf14aPageViewId,
         read_hf14a_page_get_view(app->read_hf14a_page));
 
-    // Create and add the hardware-status dashboard to the view dispatcher.
+    app->hf_mf_audit_page = hf_mf_audit_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        hf_mf_audit_page_get_view(app->hf_mf_audit_page), hf_mf_audit_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        HfMfAuditPageViewId,
+        hf_mf_audit_page_get_view(app->hf_mf_audit_page));
+
+    app->hf_sniff_page = hf_sniff_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        hf_sniff_page_get_view(app->hf_sniff_page), hf_sniff_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        HfSniffPageViewId,
+        hf_sniff_page_get_view(app->hf_sniff_page));
+
+    app->read_hf_multi_page = read_hf_multi_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        read_hf_multi_page_get_view(app->read_hf_multi_page),
+        read_hf_multi_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        ReadHfMultiPageViewId,
+        read_hf_multi_page_get_view(app->read_hf_multi_page));
+
+    app->lf_lab_page = lf_lab_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        lf_lab_page_get_view(app->lf_lab_page), lf_lab_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        LfLabPageViewId,
+        lf_lab_page_get_view(app->lf_lab_page));
+
+    app->t5577_suite_page = t5577_suite_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        t5577_suite_page_get_view(app->t5577_suite_page), t5577_suite_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        T5577SuitePageViewId,
+        t5577_suite_page_get_view(app->t5577_suite_page));
+
+    app->rf_scope_page = rf_scope_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        rf_scope_page_get_view(app->rf_scope_page), rf_scope_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        RfScopePageViewId,
+        rf_scope_page_get_view(app->rf_scope_page));
+
+    app->antenna_tune_page = antenna_tune_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        antenna_tune_page_get_view(app->antenna_tune_page), antenna_tune_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        AntennaTunePageViewId,
+        antenna_tune_page_get_view(app->antenna_tune_page));
+
+    app->pm5_control_page = pm5_control_page_create(fmps_cxt_open_operate_page, app);
+    view_set_previous_callback(
+        pm5_control_page_get_view(app->pm5_control_page), pm5_control_page_previous_callback);
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        Pm5ControlPageViewId,
+        pm5_control_page_get_view(app->pm5_control_page));
+
     app->status_page = status_page_create();
     view_set_previous_callback(
         status_page_get_view(app->status_page), status_page_previous_callback);
     view_dispatcher_add_view(
         app->view_dispatcher, StatusPageViewId, status_page_get_view(app->status_page));
 
-    // Set the back event callback to handle the back button press, and pass the app context to it
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_navigation_event_callback(
         app->view_dispatcher, fmps_cxt_back_event_callback);
@@ -156,7 +342,16 @@ void proxmark5_app_free(Proxmark5App* app) {
     view_dispatcher_remove_view(app->view_dispatcher, OperatePageViewId);
     view_dispatcher_remove_view(app->view_dispatcher, ReadHitag2PageViewId);
     view_dispatcher_remove_view(app->view_dispatcher, ReadHf14aPageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, HfMfAuditPageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, HfSniffPageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, ReadHfMultiPageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, LfLabPageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, T5577SuitePageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, RfScopePageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, AntennaTunePageViewId);
+    view_dispatcher_remove_view(app->view_dispatcher, Pm5ControlPageViewId);
     view_dispatcher_remove_view(app->view_dispatcher, StatusPageViewId);
+
     if(app->main_page) {
         main_page_free(app->main_page);
         app->main_page = NULL;
@@ -173,31 +368,58 @@ void proxmark5_app_free(Proxmark5App* app) {
         read_hf14a_page_free(app->read_hf14a_page);
         app->read_hf14a_page = NULL;
     }
+    if(app->hf_mf_audit_page) {
+        hf_mf_audit_page_free(app->hf_mf_audit_page);
+        app->hf_mf_audit_page = NULL;
+    }
+    if(app->hf_sniff_page) {
+        hf_sniff_page_free(app->hf_sniff_page);
+        app->hf_sniff_page = NULL;
+    }
+    if(app->read_hf_multi_page) {
+        read_hf_multi_page_free(app->read_hf_multi_page);
+        app->read_hf_multi_page = NULL;
+    }
+    if(app->lf_lab_page) {
+        lf_lab_page_free(app->lf_lab_page);
+        app->lf_lab_page = NULL;
+    }
+    if(app->t5577_suite_page) {
+        t5577_suite_page_destroy(app->t5577_suite_page);
+        app->t5577_suite_page = NULL;
+    }
+    if(app->rf_scope_page) {
+        rf_scope_page_free(app->rf_scope_page);
+        app->rf_scope_page = NULL;
+    }
+    if(app->antenna_tune_page) {
+        antenna_tune_page_free(app->antenna_tune_page);
+        app->antenna_tune_page = NULL;
+    }
+    if(app->pm5_control_page) {
+        pm5_control_page_free(app->pm5_control_page);
+        app->pm5_control_page = NULL;
+    }
     if(app->status_page) {
         status_page_free(app->status_page);
         app->status_page = NULL;
     }
+
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
     free(app);
 }
 
-// Furi application entry point
 int32_t fmps_cxt_app(void* p) {
     UNUSED(p);
 
-    // Initialize proxmark5 communication interfaces
     proxmark5_com_init();
 
-    // Create the app context and start the view dispatcher
     Proxmark5App* app = proxmark5_app_alloc();
-    // Default to the main page view
     view_dispatcher_switch_to_view(app->view_dispatcher, MainPageViewId);
     view_dispatcher_run(app->view_dispatcher);
-    // Free the app context and exit
     proxmark5_app_free(app);
 
-    // Deinitialize proxmark5 communication interfaces
     proxmark5_com_deinit();
 
     return 0;

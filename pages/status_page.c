@@ -91,7 +91,10 @@ static void status_page_draw_callback(Canvas* canvas, void* context) {
 
     if(model->ui_state == StatusPageStateReady) {
         elements_button_left(canvas, "Prev");
+        elements_button_center(canvas, "Refresh");
         elements_button_right(canvas, "Next");
+    } else if(model->ui_state == StatusPageStateUnreachable) {
+        elements_button_center(canvas, "Retry");
     }
 }
 
@@ -114,6 +117,13 @@ static bool status_page_input_callback(InputEvent* event, void* context) {
         }
         view_commit_model(status_page->view, changed);
         return changed;
+    }
+
+    if(event->type == InputTypeShort && event->key == InputKeyOk) {
+        if(!status_page->worker_thread_running) {
+            status_page_start(status_page);
+            return true;
+        }
     }
 
     return false;
@@ -198,35 +208,42 @@ static int32_t status_page_worker(void* context) {
     }
 
     count = 0;
-    status_test_battery_fetch(cancel, lines, &count);
-    if(status_page_worker_check_cancel(status_page)) {
-        furi_thread_list_free(thread_list);
-        return 0;
-    }
-    if(count >= 1) {
-        memcpy(rows[1][0], lines[0], STATUS_PAGE_LINE_LEN);
-    }
-    if(count >= 2) {
-        memcpy(rows[1][1], lines[1], STATUS_PAGE_LINE_LEN);
-    }
-    if(count >= 3) {
-        memcpy(rows[1][2], lines[2], STATUS_PAGE_LINE_LEN);
-    }
-    {
-        // Fault's index isn't fixed (Health may or may not precede it) -
-        // find it by prefix. Shown in place of Temp when present, since a
-        // real fault is more actionable than ambient temperature.
-        const char* fault_line = NULL;
-        for(int i = 4; i < count; i++) {
-            if(strncmp(lines[i], "Fault:", 6) == 0) {
-                fault_line = lines[i];
-                break;
-            }
+    if(strstr(rows[0][0], "BWM:   n") != NULL) {
+        // Firmware compiled without PLATFORM_EXTRAS=BWM: skip CMD_PM5_BWM_GET_BATTERY
+        // (0x0184 is not compiled in and would time out for 3s).
+        snprintf(rows[1][0], STATUS_PAGE_LINE_LEN, "BWM:   Not installed");
+        snprintf(rows[1][1], STATUS_PAGE_LINE_LEN, "Power:   USB / CEP 5V");
+    } else {
+        status_test_battery_fetch(cancel, lines, &count);
+        if(status_page_worker_check_cancel(status_page)) {
+            furi_thread_list_free(thread_list);
+            return 0;
         }
-        if(fault_line) {
-            memcpy(rows[1][3], fault_line, STATUS_PAGE_LINE_LEN);
-        } else if(count >= 4) {
-            memcpy(rows[1][3], lines[3], STATUS_PAGE_LINE_LEN);
+        if(count >= 1) {
+            memcpy(rows[1][0], lines[0], STATUS_PAGE_LINE_LEN);
+        }
+        if(count >= 2) {
+            memcpy(rows[1][1], lines[1], STATUS_PAGE_LINE_LEN);
+        }
+        if(count >= 3) {
+            memcpy(rows[1][2], lines[2], STATUS_PAGE_LINE_LEN);
+        }
+        {
+            // Fault's index isn't fixed (Health may or may not precede it) -
+            // find it by prefix. Shown in place of Temp when present, since a
+            // real fault is more actionable than ambient temperature.
+            const char* fault_line = NULL;
+            for(int i = 4; i < count; i++) {
+                if(strncmp(lines[i], "Fault:", 6) == 0) {
+                    fault_line = lines[i];
+                    break;
+                }
+            }
+            if(fault_line) {
+                memcpy(rows[1][3], fault_line, STATUS_PAGE_LINE_LEN);
+            } else if(count >= 4) {
+                memcpy(rows[1][3], lines[3], STATUS_PAGE_LINE_LEN);
+            }
         }
     }
 
@@ -263,6 +280,14 @@ static int32_t status_page_worker(void* context) {
 
     furi_thread_enumerate(thread_list);
     uint32_t stats_window_ms = furi_get_tick() - stats_start_tick;
+    FURI_LOG_I(
+        "PM5_QA_Status",
+        "OK: [%s] [%s] [%s] [%s] [%s]",
+        rows[0][0],
+        rows[0][1],
+        rows[2][0],
+        rows[2][1],
+        rows[2][2]);
     float spi_rx_cpu = 0.0f;
     for(size_t i = 0; i < furi_thread_list_size(thread_list); i++) {
         FuriThreadListItem* item = furi_thread_list_get_at(thread_list, i);

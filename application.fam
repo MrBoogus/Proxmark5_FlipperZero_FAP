@@ -8,9 +8,9 @@ App(
     stack_size=4 * 1024,
     fap_category="rfid",
     # Optional values
-    fap_version="0.1",
+    fap_version="2.0",
     fap_icon="images/fmps_cxt.png",  # 10x10 1-bit PNG
-    fap_description="Operate your PM5 on F0",
+    fap_description="Proxmark5 Companion Suite v2.0",
     fap_author="DXL",
     fap_weburl="https://github.com/RfidResearchGroup/Proxmark5_FlipperZero_FAP",
     fap_icon_assets="images",  # Image assets to compile for this application

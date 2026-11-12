@@ -73,12 +73,13 @@ static bool main_page_input_callback(InputEvent* event, void* ctx) {
     }
 
     MainPageModel* model = view_get_model(page->canvas_view);
+    bool ready = (model->state == MainPageShowDeviceInfo);
+    view_commit_model(page->canvas_view, false);
 
-    // Only handle the right button short press event when the handshake is successful
+    // Only handle the right/ok button short press event when the handshake is successful
     // and the operate callback is set
     if((event->type == InputTypeShort) &&
-       (event->key == InputKeyRight || event->key == InputKeyOk) &&
-       (model->state == MainPageShowDeviceInfo)) {
+       (event->key == InputKeyRight || event->key == InputKeyOk) && ready) {
         page->operate_callback(page->operate_callback_context);
         return true;
     }
@@ -91,23 +92,21 @@ static int32_t proxmark5_handshake_task(void* context) {
     MainPage* page = context;
     uint8_t phase = 0;
 
-    while(1) {
-        // If the thread is marked as not running, exit the loop
-        if(!page->proxmark5_handshake_thread_running) {
-            break;
-        }
-
+    while(page->proxmark5_handshake_thread_running) {
         // Advance loading animation while waiting for handshake
         phase = (phase + 1) % 4;
-        MainPageModel* model = view_get_model(page->canvas_view);
-        if(model->state == MainPageHandshakeRunning) {
-            model->loading_phase = phase;
+        {
+            MainPageModel* model = view_get_model(page->canvas_view);
+            if(model->state == MainPageHandshakeRunning) {
+                model->loading_phase = phase;
+            }
             view_commit_model(page->canvas_view, true);
         }
 
         // Try to perform the proxmark5 handshake, if successful, show the success message and exit the loop
         if(proxmark5_com_handshake()) {
             // Switch to the success state and update the view to show the success message
+            MainPageModel* model = view_get_model(page->canvas_view);
             model->state = MainPageShowDeviceInfo;
             view_commit_model(page->canvas_view, true);
             FURI_LOG_I("proxmark5_handshake_task", "Proxmark5 handshake successful");
@@ -196,6 +195,7 @@ MainPage*
     model->page = main_page;
     model->state = MainPageHandshakeRunning; // Default to the handshake running state
     model->loading_phase = 0;
+    view_commit_model(main_page->canvas_view, false);
 
     // Set the draw callback for the canvas view
     view_set_draw_callback(main_page->canvas_view, fmps_cxt_canvas_draw_callback);
