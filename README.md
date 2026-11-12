@@ -1,5 +1,30 @@
 # Proxmark5 Companion Suite for Flipper Zero (`fmps_cxt.fap`)
 
+> [!IMPORTANT]
+> ### MrBoogus Personal Fork — Version 2.0 Full Suite Overview
+> This repository transforms the basic Proxmark5 FAP companion into an enterprise-grade portable RFID/NFC lab for the Flipper Zero:
+>
+> 1. **Driver & Transport Foundation**:
+>    - Expanded [pm3_cmd.h](lib/proxmark5_driver/pm3_cmd.h) with complete command opcodes for ISO14443A reader/sniffer/chkkeys/readsc, MIFARE Classic, ISO15693, iCLASS, LF EM410x, HID Prox, T55xx, and PM5 hardware control.
+>    - Implemented `proxmark5_com_set_break_loop()` sending `0x55` sync poll bytes to cleanly break continuous PM5 operations without desynchronizing the bus.
+>    - Added an ANSI-stripped `Dbprintf` ring buffer to capture and render Proxmark5 firmware debug logs directly on the Flipper OLED.
+>
+> 2. **Modular 10-Page Architecture**:
+>    - **HF 14a & Magic Lab**: Magic card detection (`Gen1a`, `Gen1b`, `Gen2/CUID`, `Gen3 APDU`, `Gen4 GTU/GDM`, `Magic NTAG`, `SuperCard`), static nonce detection, native Flipper `.nfc` export, and Magic cloning.
+>    - **MFC Key Auditor (1K)**: Hardware-accelerated 16-sector Key A/B dictionary attack with real-time visual matrix and full sector dump export.
+>    - **14a Air Sniffer**: Passive FPGA capture with `BigBuf` trace download, protocol frame decoder (`R>` Reader / `T<` Tag), and raw trace saving.
+>    - **HF 15693 / iCLASS**: Dual-mode scanner for ISO15693 8-byte UID and HID iCLASS / PicoPass CSN & e-Purse CC.
+>    - **T5577 & EM4100 Master**: 7-mode workstation with EM4100 cloning + parity generator, block dumping, authenticated writes, SD dictionary cracker, Atmel test-mode recovery (`r0`..`r3`), and downlink password sniffer.
+>    - **LF Multi-Cloner Lab**: High-voltage LF cloner for EM410x and HID Prox with Block 0 initialization and native `.rfid` saving.
+>    - **LF Hitag2 Reader**: 32-bit transponder reader with NXP PCF transponder chip identification.
+>    - **Live RF Field Scope**: 16.7 Hz real-time scrolling RF carrier oscilloscope with peak voltage tracking and load drop detection.
+>    - **Antenna Tuner & Graph**: Graphical 85–250 kHz antenna resonance sweep with frequency divisor markers.
+>    - **PM5 Hardware Control**: Interactive controls for smart antenna LF frequency banks, Q-factor toggle, coil LEDs, WS2812 RGB lighting, and power-save modes.
+>
+> *Upstream PR branch: `v2.0-full-suite` (contains only code patches, excluding this README note).*
+
+---
+
 A modular, high-performance companion application for the **Flipper Zero** that interfaces directly with the **Proxmark5** (AT32F437 + Gowin FPGA) via the **Companion Expansion Port (CEP)** over high-speed SPI/USART.
 
 Version 2.0 leverages the Proxmark5's high-voltage RF drivers, FPGA downlink synthesis, and analog front-end, turning the Flipper Zero into a standalone portable field controller, visual analyzer, and SD card credential vault.
